@@ -68,7 +68,7 @@ const defaultSettings = Object.freeze({
     imageSize: '1K', // "1K", "2K", "4K"
     // Naistera specific
     naisteraAspectRatio: '1:1',
-    naisteraModel: 'grok', // 'grok' | 'nano banana'
+    naisteraModel: 'grok', // 'grok' | 'grok-pro' | 'nano banana 2' | 'novelai'
     naisteraSendCharAvatar: false,
     naisteraSendUserAvatar: false,
     naisteraVideoTest: false,
@@ -133,7 +133,7 @@ function isGeminiModel(modelId) {
     return mid.includes('nano-banana');
 }
 
-const NAISTERA_MODELS = Object.freeze(['grok', 'nano banana']);
+const NAISTERA_MODELS = Object.freeze(['grok', 'grok-pro', 'nano banana 2', 'novelai']);
 const DEFAULT_ENDPOINTS = Object.freeze({
     naistera: 'https://naistera.org',
 });
@@ -146,18 +146,31 @@ const ENDPOINT_PLACEHOLDERS = Object.freeze({
 function normalizeNaisteraModel(model) {
     const raw = String(model || '').trim().toLowerCase();
     if (!raw) return 'grok';
-    if (raw === 'nano-banana') return 'nano banana';
-    if (raw === 'nano-banana-pro') return 'nano banana';
-    if (raw === 'nano-banana-2') return 'nano banana';
-    if (raw === 'nano banana pro') return 'nano banana';
-    if (raw === 'nano banana 2') return 'nano banana';
+    if (raw === 'grok pro') return 'grok-pro';
+    if (raw === 'grok-pro') return 'grok-pro';
+    if (raw === 'grok-imagine-pro') return 'grok-pro';
+    if (raw === 'imagine-pro') return 'grok-pro';
+    if (raw === 'nano-banana') return 'nano banana 2';
+    if (raw === 'nano banana') return 'nano banana 2';
+    // Legacy value migration: map removed "nano banana pro" to "nano banana 2".
+    if (raw === 'nano-banana-pro') return 'nano banana 2';
+    if (raw === 'nano banana pro') return 'nano banana 2';
+    if (raw === 'nano-banana-2') return 'nano banana 2';
+    if (raw === 'nano banana 2') return 'nano banana 2';
+    if (raw === 'novel ai') return 'novelai';
+    if (raw === 'novelai') return 'novelai';
     if (NAISTERA_MODELS.includes(raw)) return raw;
     return 'grok';
 }
 
+function naisteraModelSupportsReferences(model) {
+    const normalized = normalizeNaisteraModel(model);
+    return normalized !== 'novelai' && normalized !== 'grok-pro';
+}
+
 function shouldUseNaisteraVideoTest(model) {
     const normalized = normalizeNaisteraModel(model);
-    return normalized === 'grok' || normalized === 'nano banana';
+    return normalized === 'grok' || normalized === 'grok-pro' || normalized.startsWith('nano banana');
 }
 
 function normalizeNaisteraVideoFrequency(value) {
@@ -263,6 +276,7 @@ function ensureAdditionalReferencesArray(settings = getSettings()) {
             name: String(ref?.name || '').trim(),
             imagePath: String(ref?.imagePath || '').trim(),
             matchMode: ref?.matchMode === 'always' ? 'always' : 'match',
+            enabled: ref?.enabled !== false,
         }));
 
     return settings.additionalReferences;
@@ -407,8 +421,9 @@ function getMatchedAdditionalReferences(prompt) {
             name: String(ref?.name || '').trim(),
             imagePath: normalizeStoredImagePath(ref?.imagePath || ''),
             matchMode: ref?.matchMode === 'always' ? 'always' : 'match',
+            enabled: ref?.enabled !== false,
         }))
-        .filter((ref) => ref.name && ref.imagePath);
+        .filter((ref) => ref.enabled && ref.name && ref.imagePath);
 
     const matched = [];
     const seenKeys = new Set();
@@ -444,12 +459,18 @@ function buildAdditionalReferenceRowsHtml(settings = getSettings()) {
     return refs.map((ref, index) => {
         const previewSrc = normalizeStoredImagePath(ref.imagePath);
         const isAlways = ref.matchMode === 'always';
+        const isEnabled = ref.enabled !== false;
         const previewHtml = previewSrc
             ? `<img src="${sanitizeForHtml(previewSrc)}" alt="${sanitizeForHtml(ref.name || `ref-${index + 1}`)}" style="width:56px;height:56px;object-fit:cover;border-radius:8px;border:1px solid var(--SmartThemeBorderColor, #555);">`
             : '<div style="width:56px;height:56px;border-radius:8px;border:1px dashed var(--SmartThemeBorderColor, #555);display:flex;align-items:center;justify-content:center;font-size:11px;opacity:.7;">нет</div>';
 
         return `
-            <div class="iig-additional-ref-row" data-ref-index="${index}" style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+            <div class="iig-additional-ref-row ${isEnabled ? '' : 'iig-additional-ref-row-disabled'}" data-ref-index="${index}" style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+                <label class="checkbox_label iig-additional-ref-enabled-toggle" title="${isEnabled ? 'Выключить референс' : 'Включить референс'}" style="margin:0;">
+                    <input type="checkbox" class="iig-additional-ref-enabled" ${isEnabled ? 'checked' : ''}>
+                    <span></span>
+                </label>
+                <div class="iig-additional-ref-content" style="display:flex;gap:8px;align-items:center;flex:1;min-width:0;">
                 <div class="iig-additional-ref-preview">${previewHtml}</div>
                 <div class="flex1" style="display:flex;flex-direction:column;gap:6px;">
                     <input
@@ -470,6 +491,7 @@ function buildAdditionalReferenceRowsHtml(settings = getSettings()) {
                 <div class="menu_button iig-additional-ref-remove" title="Удалить">
                     <i class="fa-solid fa-trash"></i>
                 </div>
+                </div>
             </div>
         `;
     }).join('');
@@ -486,9 +508,10 @@ function renderAdditionalReferencesList() {
     const status = document.getElementById('iig_additional_refs_status');
     if (status) {
         const refs = ensureAdditionalReferencesArray().filter((ref) => String(ref?.name || '').trim() && String(ref?.imagePath || '').trim());
-        const alwaysCount = refs.filter((ref) => ref.matchMode === 'always').length;
+        const enabledRefs = refs.filter((ref) => ref.enabled !== false);
+        const alwaysCount = enabledRefs.filter((ref) => ref.matchMode === 'always').length;
         status.textContent = refs.length > 0
-            ? `Активных доп. референсов: ${refs.length}. Всегда отправляются: ${alwaysCount}.`
+            ? `Активных доп. референсов: ${enabledRefs.length}/${refs.length}. Всегда отправляются: ${alwaysCount}.`
             : '';
     }
 }
@@ -1383,7 +1406,7 @@ function validateSettings() {
     if (settings.apiType === 'naistera') {
         const m = normalizeNaisteraModel(settings.naisteraModel);
         if (!NAISTERA_MODELS.includes(m)) {
-            errors.push('Для Naistera выберите модель: grok / nano banana');
+            errors.push('Для Naistera выберите модель: grok / grok-pro / nano banana');
         }
     }
     
@@ -1621,6 +1644,8 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
     const settings = getSettings();
     const maxRetries = settings.maxRetries;
     const baseDelay = settings.retryDelay;
+    const normalizedNaisteraModel = normalizeNaisteraModel(options.model || settings.naisteraModel);
+    const naisteraRefsSupported = naisteraModelSupportsReferences(normalizedNaisteraModel);
     
     // Collect reference images (provider-specific)
     const referenceImages = [];
@@ -1639,7 +1664,7 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
     }
 
     // Naistera references: data URLs (server uploads to Grok)
-    if (settings.apiType === 'naistera') {
+    if (settings.apiType === 'naistera' && naisteraRefsSupported) {
         if (settings.naisteraSendCharAvatar) {
             const d = await getCharacterAvatarDataUrl();
             if (d) referenceDataUrls.push(d);
@@ -1675,7 +1700,7 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
             }
         }
 
-        if (settings.apiType === 'naistera' && referenceDataUrls.length < MAX_GENERATION_REFERENCE_IMAGES) {
+        if (settings.apiType === 'naistera' && naisteraRefsSupported && referenceDataUrls.length < MAX_GENERATION_REFERENCE_IMAGES) {
             const dataUrl = await imageUrlToDataUrl(imagePath);
             if (dataUrl) {
                 referenceDataUrls.push(dataUrl);
@@ -1693,7 +1718,7 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
             );
             referenceImages.push(...contextRefs);
         }
-        if (settings.apiType === 'naistera') {
+        if (settings.apiType === 'naistera' && naisteraRefsSupported) {
             const contextRefs = await collectPreviousContextReferences(
                 options.messageId,
                 'dataUrl',
@@ -2656,7 +2681,7 @@ function createSettingsUI() {
                             <i class="fa-solid fa-eye"></i>
                         </div>
                     </div>
-                    <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera: вставьте токен из Telegram бота и выберите модель (grok / nano banana).</p>
+                    <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera: вставьте токен из Telegram бота и выберите модель (grok / grok-pro / nano banana / novelai).</p>
                     
                     <!-- Модель -->
                     <div class="flex-row ${settings.apiType === 'naistera' ? 'iig-hidden' : ''}" id="iig_model_row">
@@ -2669,32 +2694,6 @@ function createSettingsUI() {
                         </div>
                     </div>
                     
-                    <hr>
-
-                    <div class="iig-settings-card ${['naistera', 'gemini'].includes(settings.apiType) ? '' : 'iig-hidden'}" id="iig_image_context_section">
-                        <h4>Контекст картинок</h4>
-                        <p class="hint">Добавляет к генерации несколько предыдущих картинок из чата как контекст сцен и стиля.</p>
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_image_context_enabled" ${settings.imageContextEnabled ? 'checked' : ''}>
-                            <span>Включить контекст картинок</span>
-                        </label>
-                        <div class="iig-video-frequency-row ${settings.imageContextEnabled ? '' : 'iig-hidden'}" id="iig_image_context_count_row">
-                            <div class="iig-video-frequency-input">
-                                <span>Использовать</span>
-                                <input
-                                    type="number"
-                                    id="iig_image_context_count"
-                                    class="text_pole"
-                                    min="1"
-                                    max="${MAX_CONTEXT_IMAGES}"
-                                    step="1"
-                                    value="${normalizeImageContextCount(settings.imageContextCount)}"
-                                >
-                                <span>предыдущих картинок.</span>
-                            </div>
-                        </div>
-                    </div>
-
                     <div class="iig-settings-card">
                         <h4>Параметры генерации</h4>
 
@@ -2722,8 +2721,33 @@ function createSettingsUI() {
                             <label for="iig_naistera_model">Модель</label>
                             <select id="iig_naistera_model" class="flex1">
                                 <option value="grok" ${normalizeNaisteraModel(settings.naisteraModel) === 'grok' ? 'selected' : ''}>grok</option>
-                                <option value="nano banana" ${normalizeNaisteraModel(settings.naisteraModel) === 'nano banana' ? 'selected' : ''}>nano banana</option>
+                                <option value="grok-pro" ${normalizeNaisteraModel(settings.naisteraModel) === 'grok-pro' ? 'selected' : ''}>grok-pro</option>
+                                <option value="nano banana 2" ${normalizeNaisteraModel(settings.naisteraModel) === 'nano banana 2' ? 'selected' : ''}>nano banana 2</option>
+                                <option value="novelai" ${normalizeNaisteraModel(settings.naisteraModel) === 'novelai' ? 'selected' : ''}>novelai</option>
                             </select>
+                        </div>
+                        <div class="iig-settings-card-nested ${((settings.apiType === 'gemini') || (settings.apiType === 'naistera' && naisteraModelSupportsReferences(settings.naisteraModel))) ? '' : 'iig-hidden'}" id="iig_image_context_section">
+                            <h4>Контекст картинок</h4>
+                            <p class="hint">Добавляет к генерации несколько предыдущих картинок из чата как контекст сцен и стиля.</p>
+                            <label class="checkbox_label">
+                                <input type="checkbox" id="iig_image_context_enabled" ${settings.imageContextEnabled ? 'checked' : ''}>
+                                <span>Включить контекст картинок</span>
+                            </label>
+                            <div class="iig-video-frequency-row ${settings.imageContextEnabled ? '' : 'iig-hidden'}" id="iig_image_context_count_row">
+                                <div class="iig-video-frequency-input">
+                                    <span>Использовать</span>
+                                    <input
+                                        type="number"
+                                        id="iig_image_context_count"
+                                        class="text_pole"
+                                        min="1"
+                                        max="${MAX_CONTEXT_IMAGES}"
+                                        step="1"
+                                        value="${normalizeImageContextCount(settings.imageContextCount)}"
+                                    >
+                                    <span>предыдущих картинок.</span>
+                                </div>
+                            </div>
                         </div>
                         <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_aspect_row">
                             <label for="iig_naistera_aspect_ratio">Соотношение сторон</label>
@@ -2763,7 +2787,7 @@ function createSettingsUI() {
                         </div>
                     </div>
 
-                    <div class="iig-settings-card ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_refs_section">
+                    <div class="iig-settings-card ${(settings.apiType === 'naistera' && naisteraModelSupportsReferences(settings.naisteraModel)) ? '' : 'iig-hidden'}" id="iig_naistera_refs_section">
                         <h4>Референсы</h4>
                         <p class="hint">Отправлять аватарки как референсы для консистентной генерации персонажей.</p>
                         <label class="checkbox_label">
@@ -2817,7 +2841,7 @@ function createSettingsUI() {
                         </div>
                     </div>
 
-                    <div class="iig-settings-card ${['naistera', 'gemini'].includes(settings.apiType) ? '' : 'iig-hidden'}" id="iig_additional_refs_section">
+                    <div class="iig-settings-card ${((settings.apiType === 'gemini') || (settings.apiType === 'naistera' && naisteraModelSupportsReferences(settings.naisteraModel))) ? '' : 'iig-hidden'}" id="iig_additional_refs_section">
                         <h4>Дополнительные референсы</h4>
                         <p class="hint">Референс можно отправлять всегда или по совпадению. Референсу можно указать несколько имён через запятую. </p>
                         <div id="iig_additional_refs_status" class="hint" style="margin-bottom: 8px;"></div>
@@ -2900,12 +2924,13 @@ function bindSettingsEvents() {
         const isNaistera = apiType === 'naistera';
         const isGemini = apiType === 'gemini';
         const isOpenAI = apiType === 'openai';
+        const naisteraRefsSupported = isNaistera && naisteraModelSupportsReferences(settings.naisteraModel);
 
         // Model is used for OpenAI and Gemini; Naistera does not need a model.
         document.getElementById('iig_model_row')?.classList.toggle('iig-hidden', isNaistera);
-        document.getElementById('iig_image_context_section')?.classList.toggle('iig-hidden', !(isNaistera || isGemini));
-        document.getElementById('iig_image_context_count_row')?.classList.toggle('iig-hidden', !((isNaistera || isGemini) && settings.imageContextEnabled));
-        document.getElementById('iig_additional_refs_section')?.classList.toggle('iig-hidden', !(isNaistera || isGemini));
+        document.getElementById('iig_image_context_section')?.classList.toggle('iig-hidden', !(isGemini || naisteraRefsSupported));
+        document.getElementById('iig_image_context_count_row')?.classList.toggle('iig-hidden', !((isGemini || naisteraRefsSupported) && settings.imageContextEnabled));
+        document.getElementById('iig_additional_refs_section')?.classList.toggle('iig-hidden', !(isGemini || naisteraRefsSupported));
 
         // OpenAI-only params
         document.getElementById('iig_size_row')?.classList.toggle('iig-hidden', !isOpenAI);
@@ -2916,11 +2941,11 @@ function bindSettingsEvents() {
         document.getElementById('iig_naistera_aspect_row')?.classList.toggle('iig-hidden', !isNaistera);
         document.getElementById('iig_naistera_video_section')?.classList.toggle('iig-hidden', !isNaistera);
         document.getElementById('iig_naistera_video_frequency_row')?.classList.toggle('iig-hidden', !(isNaistera && settings.naisteraVideoTest));
-        document.getElementById('iig_naistera_refs_section')?.classList.toggle('iig-hidden', !isNaistera);
-        document.getElementById('iig_naistera_use_active_persona_avatar_row')?.classList.toggle('iig-hidden', !(isNaistera && settings.naisteraSendUserAvatar));
+        document.getElementById('iig_naistera_refs_section')?.classList.toggle('iig-hidden', !naisteraRefsSupported);
+        document.getElementById('iig_naistera_use_active_persona_avatar_row')?.classList.toggle('iig-hidden', !(naisteraRefsSupported && settings.naisteraSendUserAvatar));
         document.getElementById('iig_naistera_user_avatar_row')?.classList.toggle(
             'iig-hidden',
-            !(isNaistera && settings.naisteraSendUserAvatar && !settings.useActiveUserPersonaAvatar)
+            !(naisteraRefsSupported && settings.naisteraSendUserAvatar && !settings.useActiveUserPersonaAvatar)
         );
 
         document.getElementById('iig_naistera_hint')?.classList.toggle('iig-hidden', !isNaistera);
@@ -3086,6 +3111,7 @@ function bindSettingsEvents() {
     document.getElementById('iig_naistera_model')?.addEventListener('change', (e) => {
         settings.naisteraModel = normalizeNaisteraModel(e.target.value);
         saveSettings();
+        updateVisibility();
     });
 
     // Naistera aspect ratio
@@ -3198,7 +3224,7 @@ function bindSettingsEvents() {
             return;
         }
 
-        refs.push({ name: '', imagePath: '', matchMode: 'match' });
+        refs.push({ name: '', imagePath: '', matchMode: 'match', enabled: true });
         saveSettings();
         renderAdditionalReferencesList();
     });
@@ -3226,6 +3252,24 @@ function bindSettingsEvents() {
 
     document.getElementById('iig_additional_refs_list')?.addEventListener('change', async (e) => {
         const target = e.target;
+        if (target instanceof HTMLInputElement && target.classList.contains('iig-additional-ref-enabled')) {
+            const row = target.closest('.iig-additional-ref-row');
+            const index = Number.parseInt(String(row?.getAttribute('data-ref-index') || ''), 10);
+            if (!Number.isInteger(index)) {
+                return;
+            }
+
+            const refs = ensureAdditionalReferencesArray(settings);
+            if (!refs[index]) {
+                return;
+            }
+
+            refs[index].enabled = target.checked;
+            saveSettings();
+            renderAdditionalReferencesList();
+            return;
+        }
+
         if (!(target instanceof HTMLInputElement) || !target.classList.contains('iig-additional-ref-file')) {
             return;
         }

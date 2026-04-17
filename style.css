@@ -83,6 +83,23 @@
     gap: 8px;
 }
 
+.iig-additional-ref-enabled-toggle {
+    display: inline-flex;
+    align-items: center;
+    align-self: center;
+    min-height: 56px;
+}
+
+.iig-additional-ref-row-disabled .iig-additional-ref-content {
+    opacity: 0.5;
+    transition: opacity 0.15s ease;
+}
+
+.iig-additional-ref-row:not(.iig-additional-ref-row-disabled) .iig-additional-ref-content {
+    opacity: 1;
+    transition: opacity 0.15s ease;
+}
+
 .iig-naistera-refs h4 {
     margin: 0;
 }
