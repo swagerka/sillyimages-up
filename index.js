@@ -51,6 +51,9 @@ const defaultSettings = Object.freeze({
     externalBlocks: false,
     imageContextEnabled: false,
     imageContextCount: 1,
+    styles: [],
+    activeStyleId: '',
+    styleAsAdditionalReference: false,
     apiType: 'openai', // 'openai' | 'gemini' | 'naistera'
     endpoint: '',
     apiKey: '',
@@ -85,6 +88,7 @@ const PERSONAS_MODULE_PATHS = Object.freeze([
 ]);
 
 let personasModulePromise = null;
+let cachedUserAvatars = [];
 
 // Image model detection keywords (from your api_client.py)
 const IMAGE_MODEL_KEYWORDS = [
@@ -265,6 +269,79 @@ function saveSettings() {
     context.saveSettingsDebounced();
 }
 
+function ensureStyles(settings = getSettings()) {
+    if (!Array.isArray(settings.styles)) {
+        const migratedPresets = Array.isArray(settings.stylePresets) ? settings.stylePresets : [];
+        settings.styles = migratedPresets.map((preset) => ({
+            id: String(preset?.id || `iig-style-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`),
+            name: String(preset?.name || '').trim(),
+            value: String(preset?.style || '').trim(),
+        }));
+    }
+
+    settings.styles = settings.styles.map((style, index) => ({
+        id: String(style?.id || `iig-style-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`),
+        name: String(style?.name || `Стиль ${index + 1}`).trim() || `Стиль ${index + 1}`,
+        value: String(style?.value ?? style?.style ?? '').trim(),
+    }));
+
+    if (!settings.styles.some((style) => style.id === settings.activeStyleId)) {
+        settings.activeStyleId = '';
+    }
+
+    return settings.styles;
+}
+
+function createStyle(name = '') {
+    const settings = getSettings();
+    const styles = ensureStyles(settings);
+    const style = {
+        id: `iig-style-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        name: String(name || '').trim() || `Стиль ${styles.length + 1}`,
+        value: '',
+    };
+    styles.push(style);
+    settings.activeStyleId = style.id;
+    return style;
+}
+
+function getActiveStyle(settings = getSettings()) {
+    const styles = ensureStyles(settings);
+    return styles.find((style) => style.id === settings.activeStyleId) || null;
+}
+
+function updateStyle(styleId, patch) {
+    const settings = getSettings();
+    const style = ensureStyles(settings).find((item) => item.id === styleId);
+    if (!style) {
+        return null;
+    }
+
+    if (Object.hasOwn(patch, 'name')) {
+        style.name = String(patch.name || '').trim() || style.name;
+    }
+    if (Object.hasOwn(patch, 'value')) {
+        style.value = String(patch.value || '').trim();
+    }
+
+    return style;
+}
+
+function removeStyle(styleId) {
+    const settings = getSettings();
+    const styles = ensureStyles(settings);
+    const index = styles.findIndex((item) => item.id === styleId);
+    if (index === -1) {
+        return false;
+    }
+
+    styles.splice(index, 1);
+    if (settings.activeStyleId === styleId) {
+        settings.activeStyleId = styles[0]?.id || '';
+    }
+    return true;
+}
+
 function ensureAdditionalReferencesArray(settings = getSettings()) {
     if (!Array.isArray(settings.additionalReferences)) {
         settings.additionalReferences = [];
@@ -274,6 +351,7 @@ function ensureAdditionalReferencesArray(settings = getSettings()) {
         .slice(0, MAX_ADDITIONAL_REFERENCES)
         .map((ref) => ({
             name: String(ref?.name || '').trim(),
+            description: String(ref?.description || '').trim(),
             imagePath: String(ref?.imagePath || '').trim(),
             matchMode: ref?.matchMode === 'always' ? 'always' : 'match',
             enabled: ref?.enabled !== false,
@@ -415,10 +493,92 @@ function parseReferenceAliases(name) {
         .filter(Boolean);
 }
 
+const STYLE_BLOCK_RE = /\[\s*style\s*:\s*[^\]]*\]/gi;
+
+function injectStyleBlock(prompt, styleValue) {
+    const normalizedPrompt = String(prompt || '').trim();
+    const normalizedStyle = String(styleValue || '').trim();
+    if (!normalizedStyle) {
+        return normalizedPrompt;
+    }
+
+    const styleBlock = `[STYLE: ${normalizedStyle}]`;
+    if (!normalizedPrompt) {
+        return styleBlock;
+    }
+
+    STYLE_BLOCK_RE.lastIndex = 0;
+    if (STYLE_BLOCK_RE.test(normalizedPrompt)) {
+        STYLE_BLOCK_RE.lastIndex = 0;
+        let replacedFirst = false;
+        return normalizedPrompt.replace(STYLE_BLOCK_RE, () => {
+            if (replacedFirst) {
+                return '';
+            }
+            replacedFirst = true;
+            return styleBlock;
+        }).trim();
+    }
+
+    return `${styleBlock}\n\n${normalizedPrompt}`.trim();
+}
+
+function resolveEffectiveStyle(tagStyle = '', settings = getSettings()) {
+    const activeStyle = getActiveStyle(settings);
+    const extensionStyleValue = String(activeStyle?.value || '').trim();
+    const originalStyle = String(tagStyle || '').trim();
+    return extensionStyleValue || originalStyle;
+}
+
+function buildAdditionalReferencesPromptBlock(matchedRefs = []) {
+    const items = matchedRefs
+        .map((ref) => String(ref?.description || ref?.name || '').trim())
+        .filter(Boolean);
+
+    if (items.length === 0) {
+        return '';
+    }
+
+    return `Additional References:\n${items.map((item) => `- ${item}`).join('\n')}`;
+}
+
+function buildStyleReference(settings = getSettings()) {
+    if (!settings.styleAsAdditionalReference) {
+        return null;
+    }
+
+    const activeStyle = getActiveStyle(settings);
+    const value = String(activeStyle?.value || '').trim();
+    if (!value) {
+        return null;
+    }
+
+    return {
+        name: activeStyle?.name || 'style',
+        description: value,
+    };
+}
+
+function buildFinalGenerationPrompt(prompt, style, matchedAdditionalRefs = [], settings = getSettings()) {
+    const effectiveStyle = resolveEffectiveStyle(style, settings);
+    let fullPrompt = injectStyleBlock(prompt, effectiveStyle);
+
+    const styleReference = buildStyleReference(settings);
+    const additionalReferencesBlock = buildAdditionalReferencesPromptBlock(
+        styleReference ? [...matchedAdditionalRefs, styleReference] : matchedAdditionalRefs
+    );
+    if (additionalReferencesBlock) {
+        fullPrompt = `${fullPrompt}\n\n${additionalReferencesBlock}`.trim();
+    }
+
+    return fullPrompt;
+}
+
 function getMatchedAdditionalReferences(prompt) {
     const refs = ensureAdditionalReferencesArray()
         .map((ref) => ({
             name: String(ref?.name || '').trim(),
+            description: String(ref?.description || '').trim(),
             imagePath: normalizeStoredImagePath(ref?.imagePath || ''),
             matchMode: ref?.matchMode === 'always' ? 'always' : 'match',
             enabled: ref?.enabled !== false,
@@ -461,36 +621,47 @@ function buildAdditionalReferenceRowsHtml(settings = getSettings()) {
         const isAlways = ref.matchMode === 'always';
         const isEnabled = ref.enabled !== false;
         const previewHtml = previewSrc
-            ? `<img src="${sanitizeForHtml(previewSrc)}" alt="${sanitizeForHtml(ref.name || `ref-${index + 1}`)}" style="width:56px;height:56px;object-fit:cover;border-radius:8px;border:1px solid var(--SmartThemeBorderColor, #555);">`
-            : '<div style="width:56px;height:56px;border-radius:8px;border:1px dashed var(--SmartThemeBorderColor, #555);display:flex;align-items:center;justify-content:center;font-size:11px;opacity:.7;">нет</div>';
+            ? `<img src="${sanitizeForHtml(previewSrc)}" alt="${sanitizeForHtml(ref.name || `ref-${index + 1}`)}" class="iig-additional-ref-thumb">`
+            : '<div class="iig-additional-ref-thumb iig-additional-ref-thumb-placeholder">нет</div>';
 
         return `
-            <div class="iig-additional-ref-row ${isEnabled ? '' : 'iig-additional-ref-row-disabled'}" data-ref-index="${index}" style="display:flex;gap:8px;align-items:center;margin-top:8px;">
-                <label class="checkbox_label iig-additional-ref-enabled-toggle" title="${isEnabled ? 'Выключить референс' : 'Включить референс'}" style="margin:0;">
-                    <input type="checkbox" class="iig-additional-ref-enabled" ${isEnabled ? 'checked' : ''}>
-                    <span></span>
-                </label>
-                <div class="iig-additional-ref-content" style="display:flex;gap:8px;align-items:center;flex:1;min-width:0;">
-                <div class="iig-additional-ref-preview">${previewHtml}</div>
-                <div class="flex1" style="display:flex;flex-direction:column;gap:6px;">
-                    <input
-                        type="text"
-                        class="text_pole flex1 iig-additional-ref-name"
-                        placeholder="Алиасы через запятую, например Alice, Алиса"
-                        value="${sanitizeForHtml(ref.name || '')}"
-                    >
-                    <label class="checkbox_label" style="margin:0;">
-                        <input type="checkbox" class="iig-additional-ref-always" ${isAlways ? 'checked' : ''}>
-                        <span>${isAlways ? 'Отправлять всегда' : 'Отправлять по совпадению'}</span>
-                    </label>
-                </div>
-                <label class="menu_button" title="Загрузить картинку" style="display:flex;align-items:center;justify-content:center;">
-                    <i class="fa-solid fa-upload"></i>
-                    <input type="file" accept="image/*" class="iig-additional-ref-file" style="display:none">
-                </label>
-                <div class="menu_button iig-additional-ref-remove" title="Удалить">
-                    <i class="fa-solid fa-trash"></i>
-                </div>
+            <div class="iig-additional-ref-row ${isEnabled ? '' : 'iig-additional-ref-row-disabled'}" data-ref-index="${index}">
+                <div class="iig-additional-ref-content">
+                    <div class="iig-additional-ref-preview">
+                        ${previewHtml}
+                        <label class="checkbox_label iig-additional-ref-enabled-toggle" title="${isEnabled ? 'Выключить референс' : 'Включить референс'}">
+                            <input type="checkbox" class="iig-additional-ref-enabled" ${isEnabled ? 'checked' : ''}>
+                            <span></span>
+                        </label>
+                    </div>
+                    <div class="iig-additional-ref-main">
+                        <div class="iig-additional-ref-header">
+                            <input
+                                type="text"
+                                class="text_pole flex1 iig-additional-ref-name"
+                                placeholder="Имя референса"
+                                value="${sanitizeForHtml(ref.name || '')}"
+                            >
+                            <label class="menu_button iig-additional-ref-upload" title="Загрузить картинку">
+                                <i class="fa-solid fa-upload"></i>
+                                <input type="file" accept="image/*" class="iig-additional-ref-file" style="display:none">
+                            </label>
+                            <div class="menu_button iig-additional-ref-remove" title="Удалить">
+                                <i class="fa-solid fa-trash"></i>
+                            </div>
+                        </div>
+                        <textarea
+                            class="text_pole flex1 iig-additional-ref-description"
+                            rows="2"
+                            placeholder="Описание референса"
+                        >${sanitizeForHtml(ref.description || '')}</textarea>
+                        <div class="iig-additional-ref-footer">
+                            <label class="checkbox_label">
+                                <input type="checkbox" class="iig-additional-ref-always" ${isAlways ? 'checked' : ''}>
+                                <span>${isAlways ? 'Отправлять всегда' : 'Отправлять по совпадению'}</span>
+                            </label>
+                        </div>
+                    </div>
                 </div>
             </div>
         `;
@@ -514,6 +685,361 @@ function renderAdditionalReferencesList() {
             ? `Активных доп. референсов: ${enabledRefs.length}/${refs.length}. Всегда отправляются: ${alwaysCount}.`
             : '';
     }
+}
+
+function buildUserAvatarDropdownControl(prefix, selectedAvatar) {
+    return `
+        <div id="${prefix}_dropdown" class="iig-avatar-dropdown">
+            <div id="${prefix}_dropdown_selected" class="iig-avatar-dropdown-selected">
+                ${buildUserAvatarSelectedHtml(selectedAvatar)}
+            </div>
+            <div id="${prefix}_dropdown_list" class="iig-avatar-dropdown-list"></div>
+        </div>
+    `;
+}
+
+function buildStyleListHtml(settings = getSettings()) {
+    const styles = ensureStyles(settings);
+    const activeId = settings.activeStyleId;
+
+    if (styles.length === 0) {
+        return '<p class="hint">Нет стилей. Добавьте стиль и активируйте его.</p>';
+    }
+
+    return styles.map((style) => `
+        <div class="iig-style-preset-row ${style.id === activeId ? 'iig-style-preset-row-active' : ''}" data-style-id="${style.id}">
+            <div class="menu_button iig-style-preset-select" data-style-activate="${style.id}">
+                <i class="fa-solid ${style.id === activeId ? 'fa-check-circle' : 'fa-palette'}"></i>
+                <span>${sanitizeForHtml(style.name)}</span>
+            </div>
+            <div class="menu_button iig-style-preset-remove" data-style-remove="${style.id}" title="Удалить стиль">
+                <i class="fa-solid fa-trash"></i>
+            </div>
+        </div>
+    `).join('');
+}
+
+function buildStyleEditorHtml(settings = getSettings()) {
+    const activeStyle = getActiveStyle(settings);
+    if (!activeStyle) {
+        return '<p class="hint">Активируйте стиль, чтобы редактировать его значение.</p>';
+    }
+
+    return `
+        <div class="iig-settings-card iig-style-editor-card">
+            <h4>Активный стиль: ${sanitizeForHtml(activeStyle.name)}</h4>
+            <div class="flex-row">
+                <label for="iig_style_name">Название</label>
+                <input type="text" id="iig_style_name" class="text_pole flex1" value="${sanitizeForHtml(activeStyle.name)}">
+                <div id="iig_style_disable" class="menu_button" title="Выключить стиль">
+                    <i class="fa-solid fa-power-off"></i>
+                </div>
+            </div>
+            <div class="flex-row">
+                <label for="iig_style_value">Значение</label>
+                <textarea id="iig_style_value" class="text_pole flex1 iig-settings-textarea" rows="3" placeholder="masterpiece, cinematic lighting, painterly">${sanitizeForHtml(activeStyle.value)}</textarea>
+                <div></div>
+            </div>
+        </div>
+    `;
+}
+
+function renderStyleSettings() {
+    const settings = getSettings();
+    const listContainer = document.getElementById('iig_style_presets');
+    const editorContainer = document.getElementById('iig_style_editor');
+    if (listContainer) {
+        listContainer.innerHTML = buildStyleListHtml(settings);
+    }
+    if (editorContainer) {
+        editorContainer.innerHTML = buildStyleEditorHtml(settings);
+    }
+}
+
+function applyConfiguredStyleToTag(tag, settings = getSettings()) {
+    if (!tag) {
+        return tag;
+    }
+
+    const effectiveStyle = resolveEffectiveStyle(tag.style, settings);
+    tag.style = effectiveStyle;
+    return tag;
+}
+
+function buildSettingsSectionHtml(sectionId, title, bodyHtml, expanded = true) {
+    return `
+        <div class="iig-section" data-section-id="${sectionId}">
+            <div class="iig-section-toggle" data-section-toggle="${sectionId}">
+                <span class="iig-section-title">${title}</span>
+                <i class="fa-solid fa-chevron-down iig-section-chevron ${expanded ? '' : 'iig-section-chevron-collapsed'}"></i>
+            </div>
+            <div class="iig-section-body ${expanded ? '' : 'iig-hidden'}" id="${sectionId}">
+                ${bodyHtml}
+            </div>
+        </div>
+    `;
+}
+
+function buildApiSettingsSectionHtml(settings = getSettings()) {
+    const bodyHtml = `
+        <div class="iig-settings-card">
+            <label class="checkbox_label">
+                <input type="checkbox" id="iig_enabled" ${settings.enabled ? 'checked' : ''}>
+                <span>Включить генерацию картинок</span>
+            </label>
+            <label class="checkbox_label">
+                <input type="checkbox" id="iig_external_blocks" ${settings.externalBlocks ? 'checked' : ''}>
+                <span>Работа с внешними блоками</span>
+            </label>
+
+            <div class="flex-row">
+                <label for="iig_api_type">Тип API</label>
+                <select id="iig_api_type" class="flex1">
+                    <option value="openai" ${settings.apiType === 'openai' ? 'selected' : ''}>OpenAI-совместимый (/v1/images/generations)</option>
+                    <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini-совместимый (nano-banana)</option>
+                    <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>Naistera (naistera.org)</option>
+                </select>
+                <div></div>
+            </div>
+
+            <div class="flex-row">
+                <label for="iig_endpoint">URL эндпоинта</label>
+                <input type="text" id="iig_endpoint" class="text_pole flex1" value="${settings.endpoint}" placeholder="https://api.example.com">
+                <div></div>
+            </div>
+
+            <div class="flex-row">
+                <label for="iig_api_key">API ключ</label>
+                <input type="password" id="iig_api_key" class="text_pole flex1" value="${settings.apiKey}">
+                <div id="iig_key_toggle" class="menu_button iig-key-toggle" title="Показать/Скрыть">
+                    <i class="fa-solid fa-eye"></i>
+                </div>
+            </div>
+
+            <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera: вставьте токен из Telegram бота и выберите модель (grok / grok-pro / nano banana 2 / novelai).</p>
+
+            <div class="flex-row ${settings.apiType === 'naistera' ? 'iig-hidden' : ''}" id="iig_model_row">
+                <label for="iig_model">Модель</label>
+                <select id="iig_model" class="flex1">
+                    ${settings.model ? `<option value="${settings.model}" selected>${settings.model}</option>` : '<option value="">-- Выберите модель --</option>'}
+                </select>
+                <div id="iig_refresh_models" class="menu_button iig-refresh-btn" title="Обновить список">
+                    <i class="fa-solid fa-sync"></i>
+                </div>
+            </div>
+
+            <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_size_row">
+                <label for="iig_size">Размер</label>
+                <select id="iig_size" class="flex1">
+                    <option value="1024x1024" ${settings.size === '1024x1024' ? 'selected' : ''}>1024x1024 (Квадрат)</option>
+                    <option value="1792x1024" ${settings.size === '1792x1024' ? 'selected' : ''}>1792x1024 (Альбомная)</option>
+                    <option value="1024x1792" ${settings.size === '1024x1792' ? 'selected' : ''}>1024x1792 (Портретная)</option>
+                    <option value="512x512" ${settings.size === '512x512' ? 'selected' : ''}>512x512 (Маленький)</option>
+                </select>
+                <div></div>
+            </div>
+
+            <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_quality_row">
+                <label for="iig_quality">Качество</label>
+                <select id="iig_quality" class="flex1">
+                    <option value="standard" ${settings.quality === 'standard' ? 'selected' : ''}>Стандартное</option>
+                    <option value="hd" ${settings.quality === 'hd' ? 'selected' : ''}>HD</option>
+                </select>
+                <div></div>
+            </div>
+
+            <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_model_row">
+                <label for="iig_naistera_model">Модель</label>
+                <select id="iig_naistera_model" class="flex1">
+                    <option value="grok" ${normalizeNaisteraModel(settings.naisteraModel) === 'grok' ? 'selected' : ''}>grok</option>
+                    <option value="grok-pro" ${normalizeNaisteraModel(settings.naisteraModel) === 'grok-pro' ? 'selected' : ''}>grok-pro</option>
+                    <option value="nano banana 2" ${normalizeNaisteraModel(settings.naisteraModel) === 'nano banana 2' ? 'selected' : ''}>nano banana 2</option>
+                    <option value="novelai" ${normalizeNaisteraModel(settings.naisteraModel) === 'novelai' ? 'selected' : ''}>novelai</option>
+                </select>
+                <div></div>
+            </div>
+
+            <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_aspect_row">
+                <label for="iig_naistera_aspect_ratio">Соотношение сторон</label>
+                <select id="iig_naistera_aspect_ratio" class="flex1">
+                    <option value="1:1" ${settings.naisteraAspectRatio === '1:1' ? 'selected' : ''}>1:1</option>
+                    <option value="16:9" ${settings.naisteraAspectRatio === '16:9' ? 'selected' : ''}>16:9</option>
+                    <option value="9:16" ${settings.naisteraAspectRatio === '9:16' ? 'selected' : ''}>9:16</option>
+                    <option value="3:2" ${settings.naisteraAspectRatio === '3:2' ? 'selected' : ''}>3:2</option>
+                    <option value="2:3" ${settings.naisteraAspectRatio === '2:3' ? 'selected' : ''}>2:3</option>
+                </select>
+                <div></div>
+            </div>
+
+            <div id="iig_avatar_section" class="iig-settings-card-nested ${settings.apiType !== 'gemini' ? 'hidden' : ''}">
+                <div class="flex-row">
+                    <label for="iig_aspect_ratio">Соотношение сторон</label>
+                    <select id="iig_aspect_ratio" class="flex1">
+                        <option value="1:1" ${settings.aspectRatio === '1:1' ? 'selected' : ''}>1:1 (Квадрат)</option>
+                        <option value="2:3" ${settings.aspectRatio === '2:3' ? 'selected' : ''}>2:3 (Портрет)</option>
+                        <option value="3:2" ${settings.aspectRatio === '3:2' ? 'selected' : ''}>3:2 (Альбом)</option>
+                        <option value="3:4" ${settings.aspectRatio === '3:4' ? 'selected' : ''}>3:4 (Портрет)</option>
+                        <option value="4:3" ${settings.aspectRatio === '4:3' ? 'selected' : ''}>4:3 (Альбом)</option>
+                        <option value="4:5" ${settings.aspectRatio === '4:5' ? 'selected' : ''}>4:5 (Портрет)</option>
+                        <option value="5:4" ${settings.aspectRatio === '5:4' ? 'selected' : ''}>5:4 (Альбом)</option>
+                        <option value="9:16" ${settings.aspectRatio === '9:16' ? 'selected' : ''}>9:16 (Вертикальный)</option>
+                        <option value="16:9" ${settings.aspectRatio === '16:9' ? 'selected' : ''}>16:9 (Широкий)</option>
+                        <option value="21:9" ${settings.aspectRatio === '21:9' ? 'selected' : ''}>21:9 (Ультраширокий)</option>
+                    </select>
+                    <div></div>
+                </div>
+                <div class="flex-row">
+                    <label for="iig_image_size">Разрешение</label>
+                    <select id="iig_image_size" class="flex1">
+                        <option value="1K" ${settings.imageSize === '1K' ? 'selected' : ''}>1K (по умолчанию)</option>
+                        <option value="2K" ${settings.imageSize === '2K' ? 'selected' : ''}>2K</option>
+                        <option value="4K" ${settings.imageSize === '4K' ? 'selected' : ''}>4K</option>
+                    </select>
+                    <div></div>
+                </div>
+            </div>
+
+            <div class="iig-settings-card-nested ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_video_section">
+                <h4>Видео</h4>
+                <label class="checkbox_label">
+                    <input type="checkbox" id="iig_naistera_video_test" ${settings.naisteraVideoTest ? 'checked' : ''}>
+                    <span>Включить генерацию видео</span>
+                </label>
+                <div class="iig-video-frequency-row ${settings.naisteraVideoTest ? '' : 'iig-hidden'}" id="iig_naistera_video_frequency_row">
+                    <div class="iig-video-frequency-input">
+                        <span>Каждые</span>
+                        <input type="number" id="iig_naistera_video_every_n" class="text_pole" min="1" max="999" step="1" value="${normalizeNaisteraVideoFrequency(settings.naisteraVideoEveryN)}">
+                        <span>сообщений.</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+    return buildSettingsSectionHtml('iig_api_section', 'Настройки API', bodyHtml, true);
+}
+
+function buildStylesSettingsSectionHtml() {
+    const bodyHtml = `
+        <div class="iig-settings-card">
+            <div class="flex-row">
+                <label for="iig_new_style_name">Новый стиль</label>
+                <input type="text" id="iig_new_style_name" class="text_pole flex1" placeholder="Название стиля">
+                <div id="iig_style_add" class="menu_button" title="Добавить стиль">
+                    <i class="fa-solid fa-plus"></i>
+                </div>
+            </div>
+            <div id="iig_style_presets" class="iig-style-presets"></div>
+            <div id="iig_style_editor"></div>
+        </div>
+    `;
+    return buildSettingsSectionHtml('iig_styles_section', 'Стили', bodyHtml, false);
+}
+
+function buildReferencesSettingsSectionHtml(settings = getSettings()) {
+    const geminiUserAvatarDropdown = buildUserAvatarDropdownControl('iig_user_avatar', settings.userAvatarFile);
+    const naisteraUserAvatarDropdown = buildUserAvatarDropdownControl('iig_naistera_user_avatar', settings.userAvatarFile);
+
+    const bodyHtml = `
+        <div class="iig-settings-card">
+            <div id="iig_avatar_refs_section" class="iig-settings-card-nested ${settings.apiType !== 'gemini' ? 'hidden' : ''}">
+                <h4>Gemini / nano-banana</h4>
+                <label class="checkbox_label">
+                    <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>
+                    <span>Отправлять аватар {{char}}</span>
+                </label>
+                <label class="checkbox_label">
+                    <input type="checkbox" id="iig_send_user_avatar" ${settings.sendUserAvatar ? 'checked' : ''}>
+                    <span>Отправлять аватар {{user}}</span>
+                </label>
+                <label id="iig_use_active_persona_avatar_row" class="checkbox_label ${!settings.sendUserAvatar ? 'hidden' : ''}">
+                    <input type="checkbox" id="iig_use_active_persona_avatar" ${settings.useActiveUserPersonaAvatar ? 'checked' : ''}>
+                    <span>Брать аватар из активной персоны {{user}}</span>
+                </label>
+                <div id="iig_user_avatar_row" class="flex-row ${!settings.sendUserAvatar || settings.useActiveUserPersonaAvatar ? 'hidden' : ''}">
+                    <label>Аватар {{user}}</label>
+                    ${geminiUserAvatarDropdown}
+                    <div id="iig_refresh_avatars" class="menu_button iig-refresh-btn" title="Обновить список">
+                        <i class="fa-solid fa-sync"></i>
+                    </div>
+                </div>
+            </div>
+
+            <div class="iig-settings-card-nested ${(settings.apiType === 'naistera' && naisteraModelSupportsReferences(settings.naisteraModel)) ? '' : 'iig-hidden'}" id="iig_naistera_refs_section">
+                <h4>Naistera</h4>
+                <label class="checkbox_label">
+                    <input type="checkbox" id="iig_naistera_send_char_avatar" ${settings.naisteraSendCharAvatar ? 'checked' : ''}>
+                    <span>Отправлять аватар {{char}}</span>
+                </label>
+                <label class="checkbox_label">
+                    <input type="checkbox" id="iig_naistera_send_user_avatar" ${settings.naisteraSendUserAvatar ? 'checked' : ''}>
+                    <span>Отправлять аватар {{user}}</span>
+                </label>
+                <label id="iig_naistera_use_active_persona_avatar_row" class="checkbox_label ${!settings.naisteraSendUserAvatar ? 'iig-hidden' : ''}">
+                    <input type="checkbox" id="iig_naistera_use_active_persona_avatar" ${settings.useActiveUserPersonaAvatar ? 'checked' : ''}>
+                    <span>Брать аватар из активной персоны {{user}}</span>
+                </label>
+                <div id="iig_naistera_user_avatar_row" class="flex-row ${!settings.naisteraSendUserAvatar || settings.useActiveUserPersonaAvatar ? 'iig-hidden' : ''}">
+                    <label>Аватар {{user}}</label>
+                    ${naisteraUserAvatarDropdown}
+                    <div id="iig_naistera_refresh_avatars" class="menu_button iig-refresh-btn" title="Обновить список">
+                        <i class="fa-solid fa-sync"></i>
+                    </div>
+                </div>
+            </div>
+
+            <div class="iig-settings-card-nested ${((settings.apiType === 'gemini') || (settings.apiType === 'naistera' && naisteraModelSupportsReferences(settings.naisteraModel))) ? '' : 'iig-hidden'}" id="iig_image_context_section">
+                <h4>Контекст картинок</h4>
+                <label class="checkbox_label">
+                    <input type="checkbox" id="iig_image_context_enabled" ${settings.imageContextEnabled ? 'checked' : ''}>
+                    <span>Включить контекст картинок</span>
+                </label>
+                <div class="iig-video-frequency-row ${settings.imageContextEnabled ? '' : 'iig-hidden'}" id="iig_image_context_count_row">
+                    <div class="iig-video-frequency-input">
+                        <span>Использовать</span>
+                        <input type="number" id="iig_image_context_count" class="text_pole" min="1" max="${MAX_CONTEXT_IMAGES}" step="1" value="${normalizeImageContextCount(settings.imageContextCount)}">
+                        <span>предыдущих картинок.</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="iig-settings-card-nested ${((settings.apiType === 'gemini') || (settings.apiType === 'naistera' && naisteraModelSupportsReferences(settings.naisteraModel))) ? '' : 'iig-hidden'}" id="iig_additional_refs_section">
+                <h4>Дополнительные референсы</h4>
+                <div class="iig-additional-ref-actions">
+                    <div id="iig_additional_refs_add" class="menu_button iig-button-inline">
+                        <i class="fa-solid fa-plus"></i> Добавить референс
+                    </div>
+                </div>
+                <div id="iig_additional_refs_status" class="hint" style="margin-bottom: 8px;"></div>
+                <div id="iig_additional_refs_list"></div>
+            </div>
+        </div>
+    `;
+    return buildSettingsSectionHtml('iig_references_section', 'Референсы', bodyHtml, true);
+}
+
+function buildDebugSettingsSectionHtml(settings = getSettings()) {
+    const bodyHtml = `
+        <div class="iig-settings-card">
+            <div class="iig-settings-card-nested">
+                <div class="flex-row">
+                    <label for="iig_max_retries">Макс. повторов</label>
+                    <input type="number" id="iig_max_retries" class="text_pole flex1" value="${settings.maxRetries}" min="0" max="5">
+                    <div></div>
+                </div>
+                <div class="flex-row">
+                    <label for="iig_retry_delay">Задержка (мс)</label>
+                    <input type="number" id="iig_retry_delay" class="text_pole flex1" value="${settings.retryDelay}" min="500" max="10000" step="500">
+                    <div></div>
+                </div>
+            </div>
+            <div class="iig-debug-actions">
+                <div id="iig_export_logs" class="menu_button iig-button-inline">
+                    <i class="fa-solid fa-download"></i> Экспорт логов
+                </div>
+            </div>
+        </div>
+    `;
+    return buildSettingsSectionHtml('iig_debug_section', 'Отладка', bodyHtml, false);
 }
 
 async function readFileAsDataUrl(file) {
@@ -623,8 +1149,21 @@ async function fetchUserAvatars() {
         if (!response.ok) {
             throw new Error(`HTTP ${response.status}`);
         }
-        
-        return await response.json(); // Returns array of filenames
+
+        const payload = await response.json();
+        const avatars = Array.isArray(payload)
+            ? payload
+            : Array.isArray(payload?.avatars)
+                ? payload.avatars
+                : Array.isArray(payload?.files)
+                    ? payload.files
+                    : [];
+
+        cachedUserAvatars = avatars
+            .map((avatar) => String(avatar || '').trim())
+            .filter(Boolean);
+
+        return cachedUserAvatars;
     } catch (error) {
         console.error('[IIG] Failed to fetch user avatars:', error);
         return [];
@@ -635,6 +1174,63 @@ function getUserAvatarSelects() {
     return ['iig_user_avatar_file', 'iig_naistera_user_avatar_file']
         .map((id) => document.getElementById(id))
         .filter(Boolean);
+}
+
+function getUserAvatarDropdownConfigs() {
+    return [
+        {
+            rootId: 'iig_user_avatar_dropdown',
+            selectedId: 'iig_user_avatar_dropdown_selected',
+            listId: 'iig_user_avatar_dropdown_list',
+            refreshId: 'iig_refresh_avatars',
+        },
+        {
+            rootId: 'iig_naistera_user_avatar_dropdown',
+            selectedId: 'iig_naistera_user_avatar_dropdown_selected',
+            listId: 'iig_naistera_user_avatar_dropdown_list',
+            refreshId: 'iig_naistera_refresh_avatars',
+        },
+    ].filter((config) => document.getElementById(config.selectedId));
+}
+
+function buildUserAvatarSelectedHtml(avatarFile) {
+    return avatarFile
+        ? `<img class="iig-dropdown-thumb" src="/User Avatars/${encodeURIComponent(avatarFile)}" alt="" onerror="this.style.display='none'">
+           <span class="iig-dropdown-text">${sanitizeForHtml(avatarFile)}</span>
+           <span class="iig-dropdown-arrow fa-solid fa-chevron-down"></span>`
+        : `<div class="iig-dropdown-placeholder"><i class="fa-solid fa-user"></i></div>
+           <span class="iig-dropdown-text">Выберите аватар</span>
+           <span class="iig-dropdown-arrow fa-solid fa-chevron-down"></span>`;
+}
+
+function closeUserAvatarDropdowns() {
+    for (const { rootId } of getUserAvatarDropdownConfigs()) {
+        document.getElementById(rootId)?.classList.remove('open');
+    }
+}
+
+function renderUserAvatarDropdownList(listElement, avatars, selectedAvatar) {
+    if (!listElement) {
+        return;
+    }
+
+    listElement.innerHTML = '';
+
+    for (const avatarFile of avatars) {
+        const item = document.createElement('div');
+        item.className = `iig-avatar-dropdown-item ${selectedAvatar === avatarFile ? 'selected' : ''}`;
+        item.dataset.value = avatarFile;
+        item.innerHTML = `
+            <img class="iig-item-thumb" src="/User Avatars/${encodeURIComponent(avatarFile)}" alt="${sanitizeForHtml(avatarFile)}" loading="lazy" onerror="this.style.display='none'">
+            <span class="iig-item-name">${sanitizeForHtml(avatarFile)}</span>`;
+        item.addEventListener('click', () => {
+            const settings = getSettings();
+            settings.userAvatarFile = avatarFile;
+            saveSettings();
+            syncUserAvatarSelection(avatarFile);
+        });
+        listElement.appendChild(item);
+    }
 }
 
 function getActivePersonaAvatarCheckboxes() {
@@ -659,6 +1255,19 @@ function syncUserAvatarSelection(selectedAvatar) {
         }
         select.value = selectedAvatar || '';
     }
+
+    for (const config of getUserAvatarDropdownConfigs()) {
+        const selectedElement = document.getElementById(config.selectedId);
+        const listElement = document.getElementById(config.listId);
+        if (selectedElement) {
+            selectedElement.innerHTML = buildUserAvatarSelectedHtml(selectedAvatar);
+        }
+        if (listElement) {
+            renderUserAvatarDropdownList(listElement, cachedUserAvatars, selectedAvatar);
+        }
+    }
+
+    closeUserAvatarDropdowns();
 }
 
 function populateUserAvatarSelects(avatars, selectedAvatar) {
@@ -671,6 +1280,11 @@ function populateUserAvatarSelects(avatars, selectedAvatar) {
             option.textContent = avatar;
             select.appendChild(option);
         }
+    }
+
+    for (const config of getUserAvatarDropdownConfigs()) {
+        const listElement = document.getElementById(config.listId);
+        renderUserAvatarDropdownList(listElement, avatars, selectedAvatar);
     }
 
     syncUserAvatarSelection(selectedAvatar);
@@ -1116,8 +1730,7 @@ async function generateImageOpenAI(prompt, style, referenceImages = [], options 
     const settings = getSettings();
     const url = `${settings.endpoint.replace(/\/$/, '')}/v1/images/generations`;
     
-    // Combine style and prompt
-    const fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
+    const fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings);
     
     // Map aspect ratio to size if provided in tag
     let size = settings.size;
@@ -1218,7 +1831,7 @@ async function generateImageGemini(prompt, style, referenceImages = [], options 
     }
     
     // Add prompt with style and reference instruction
-    let fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
+    let fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings);
     
     // If reference images provided, add instruction to copy appearance
     if (referenceImages.length > 0) {
@@ -1318,7 +1931,7 @@ async function generateImageNaistera(prompt, style, options = {}) {
     const referenceImages = options.referenceImages || [];
     const wantsVideoTest = Boolean(options.videoTestMode);
     const videoEveryN = normalizeNaisteraVideoFrequency(options.videoEveryN ?? settings.naisteraVideoEveryN);
-    let fullPrompt = style ? `[Style: ${style}] ${prompt}` : prompt;
+    let fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings);
 
     if (referenceImages.length > 0) {
         const refInstruction = `[CRITICAL: The reference image(s) above show the EXACT appearance of the character(s). You MUST precisely copy their: face structure, eye color, hair color and style, skin tone, body type, clothing, and all distinctive features. Do not deviate from the reference appearances.]`;
@@ -1679,7 +2292,7 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
     if (matchedAdditionalRefs.length > 0) {
         iigLog(
             'INFO',
-            `Matched additional refs: ${matchedAdditionalRefs.map((ref) => `${ref.name} [${ref.matchMode}]`).join(', ')}`
+            `Matched additional refs: ${matchedAdditionalRefs.map((ref) => `${ref.name} [${ref.matchMode}] => ${ref.description || ref.name}`).join(', ')}`
         );
     }
 
@@ -1751,13 +2364,20 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
                 generated = await generateImageNaistera(prompt, style, {
                     ...options,
                     referenceImages: referenceDataUrls,
+                    matchedAdditionalRefs,
                     videoTestMode: enableVideoTest,
                     videoEveryN: settings.naisteraVideoEveryN,
                 });
             } else if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
-                generated = await generateImageGemini(prompt, style, referenceImages, options);
+                generated = await generateImageGemini(prompt, style, referenceImages, {
+                    ...options,
+                    matchedAdditionalRefs,
+                });
             } else {
-                generated = await generateImageOpenAI(prompt, style, referenceImages, options);
+                generated = await generateImageOpenAI(prompt, style, referenceImages, {
+                    ...options,
+                    matchedAdditionalRefs,
+                });
             }
 
             if (generated && typeof generated === 'object' && generated.kind === 'video') {
@@ -2182,6 +2802,7 @@ async function processMessageTags(messageId) {
     // Process each tag in parallel
     const processTag = async (tag, index) => {
         const tagId = `iig-${messageId}-${index}`;
+        applyConfiguredStyleToTag(tag, settings);
         
         iigLog('INFO', `Processing tag ${index}: ${tag.fullMatch.substring(0, 50)}`);
         
@@ -2457,6 +3078,7 @@ async function regenerateMessageImages(messageId) {
     for (let index = 0; index < tags.length; index++) {
         const tag = tags[index];
         const tagId = `iig-regen-${messageId}-${index}`;
+        applyConfiguredStyleToTag(tag, settings);
         
         try {
             // Find the existing rendered media element with data-iig-instruction
@@ -2624,7 +3246,6 @@ async function onMessageReceived(messageId) {
  */
 function createSettingsUI() {
     const settings = getSettings();
-    const context = SillyTavern.getContext();
     
     const container = document.getElementById('extensions_settings');
     if (!container) {
@@ -2640,268 +3261,10 @@ function createSettingsUI() {
             </div>
             <div class="inline-drawer-content">
                 <div class="iig-settings">
-                    <!-- Вкл/Выкл -->
-                    <label class="checkbox_label">
-                        <input type="checkbox" id="iig_enabled" ${settings.enabled ? 'checked' : ''}>
-                        <span>Включить генерацию картинок</span>
-                    </label>
-                    <label class="checkbox_label" style="margin-top: 6px;">
-                        <input type="checkbox" id="iig_external_blocks" ${settings.externalBlocks ? 'checked' : ''}>
-                        <span>Работа с внешними блоками</span>
-                    </label>
-                    
-                    <hr>
-                    
-                    <h4>Настройки API</h4>
-                    
-                    <!-- Тип эндпоинта -->
-                    <div class="flex-row">
-                        <label for="iig_api_type">Тип API</label>
-                        <select id="iig_api_type" class="flex1">
-                            <option value="openai" ${settings.apiType === 'openai' ? 'selected' : ''}>OpenAI-совместимый (/v1/images/generations)</option>
-                            <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini-совместимый (nano-banana)</option>
-                            <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>Naistera (naistera.org)</option>
-                        </select>
-                    </div>
-                    
-                    <!-- URL эндпоинта -->
-                    <div class="flex-row">
-                        <label for="iig_endpoint">URL эндпоинта</label>
-                        <input type="text" id="iig_endpoint" class="text_pole flex1" 
-                               value="${settings.endpoint}" 
-                               placeholder="https://api.example.com">
-                    </div>
-                    
-                    <!-- API ключ -->
-                    <div class="flex-row">
-                        <label for="iig_api_key">API ключ</label>
-                        <input type="password" id="iig_api_key" class="text_pole flex1" 
-                               value="${settings.apiKey}">
-                        <div id="iig_key_toggle" class="menu_button iig-key-toggle" title="Показать/Скрыть">
-                            <i class="fa-solid fa-eye"></i>
-                        </div>
-                    </div>
-                    <p id="iig_naistera_hint" class="hint ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}">Для Naistera: вставьте токен из Telegram бота и выберите модель (grok / grok-pro / nano banana / novelai).</p>
-                    
-                    <!-- Модель -->
-                    <div class="flex-row ${settings.apiType === 'naistera' ? 'iig-hidden' : ''}" id="iig_model_row">
-                        <label for="iig_model">Модель</label>
-                        <select id="iig_model" class="flex1">
-                            ${settings.model ? `<option value="${settings.model}" selected>${settings.model}</option>` : '<option value="">-- Выберите модель --</option>'}
-                        </select>
-                        <div id="iig_refresh_models" class="menu_button iig-refresh-btn" title="Обновить список">
-                            <i class="fa-solid fa-sync"></i>
-                        </div>
-                    </div>
-                    
-                    <div class="iig-settings-card">
-                        <h4>Параметры генерации</h4>
-
-                        <!-- Размер -->
-                        <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_size_row">
-                            <label for="iig_size">Размер</label>
-                            <select id="iig_size" class="flex1">
-                                <option value="1024x1024" ${settings.size === '1024x1024' ? 'selected' : ''}>1024x1024 (Квадрат)</option>
-                                <option value="1792x1024" ${settings.size === '1792x1024' ? 'selected' : ''}>1792x1024 (Альбомная)</option>
-                                <option value="1024x1792" ${settings.size === '1024x1792' ? 'selected' : ''}>1024x1792 (Портретная)</option>
-                                <option value="512x512" ${settings.size === '512x512' ? 'selected' : ''}>512x512 (Маленький)</option>
-                            </select>
-                        </div>
-
-                        <!-- Качество -->
-                        <div class="flex-row ${settings.apiType !== 'openai' ? 'iig-hidden' : ''}" id="iig_quality_row">
-                            <label for="iig_quality">Качество</label>
-                            <select id="iig_quality" class="flex1">
-                                <option value="standard" ${settings.quality === 'standard' ? 'selected' : ''}>Стандартное</option>
-                                <option value="hd" ${settings.quality === 'hd' ? 'selected' : ''}>HD</option>
-                            </select>
-                        </div>
-
-                        <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_model_row">
-                            <label for="iig_naistera_model">Модель</label>
-                            <select id="iig_naistera_model" class="flex1">
-                                <option value="grok" ${normalizeNaisteraModel(settings.naisteraModel) === 'grok' ? 'selected' : ''}>grok</option>
-                                <option value="grok-pro" ${normalizeNaisteraModel(settings.naisteraModel) === 'grok-pro' ? 'selected' : ''}>grok-pro</option>
-                                <option value="nano banana 2" ${normalizeNaisteraModel(settings.naisteraModel) === 'nano banana 2' ? 'selected' : ''}>nano banana 2</option>
-                                <option value="novelai" ${normalizeNaisteraModel(settings.naisteraModel) === 'novelai' ? 'selected' : ''}>novelai</option>
-                            </select>
-                        </div>
-                        <div class="iig-settings-card-nested ${((settings.apiType === 'gemini') || (settings.apiType === 'naistera' && naisteraModelSupportsReferences(settings.naisteraModel))) ? '' : 'iig-hidden'}" id="iig_image_context_section">
-                            <h4>Контекст картинок</h4>
-                            <p class="hint">Добавляет к генерации несколько предыдущих картинок из чата как контекст сцен и стиля.</p>
-                            <label class="checkbox_label">
-                                <input type="checkbox" id="iig_image_context_enabled" ${settings.imageContextEnabled ? 'checked' : ''}>
-                                <span>Включить контекст картинок</span>
-                            </label>
-                            <div class="iig-video-frequency-row ${settings.imageContextEnabled ? '' : 'iig-hidden'}" id="iig_image_context_count_row">
-                                <div class="iig-video-frequency-input">
-                                    <span>Использовать</span>
-                                    <input
-                                        type="number"
-                                        id="iig_image_context_count"
-                                        class="text_pole"
-                                        min="1"
-                                        max="${MAX_CONTEXT_IMAGES}"
-                                        step="1"
-                                        value="${normalizeImageContextCount(settings.imageContextCount)}"
-                                    >
-                                    <span>предыдущих картинок.</span>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="flex-row ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_aspect_row">
-                            <label for="iig_naistera_aspect_ratio">Соотношение сторон</label>
-                            <select id="iig_naistera_aspect_ratio" class="flex1">
-                                <option value="1:1" ${settings.naisteraAspectRatio === '1:1' ? 'selected' : ''}>1:1</option>
-                                <option value="16:9" ${settings.naisteraAspectRatio === '16:9' ? 'selected' : ''}>16:9</option>
-                                <option value="9:16" ${settings.naisteraAspectRatio === '9:16' ? 'selected' : ''}>9:16</option>
-                                <option value="3:2" ${settings.naisteraAspectRatio === '3:2' ? 'selected' : ''}>3:2</option>
-                                <option value="2:3" ${settings.naisteraAspectRatio === '2:3' ? 'selected' : ''}>2:3</option>
-                            </select>
-                        </div>
-
-                        <div id="iig_avatar_section" class="iig-settings-card-nested ${settings.apiType !== 'gemini' ? 'hidden' : ''}">
-                            <div class="flex-row">
-                                <label for="iig_aspect_ratio">Соотношение сторон</label>
-                                <select id="iig_aspect_ratio" class="flex1">
-                                    <option value="1:1" ${settings.aspectRatio === '1:1' ? 'selected' : ''}>1:1 (Квадрат)</option>
-                                    <option value="2:3" ${settings.aspectRatio === '2:3' ? 'selected' : ''}>2:3 (Портрет)</option>
-                                    <option value="3:2" ${settings.aspectRatio === '3:2' ? 'selected' : ''}>3:2 (Альбом)</option>
-                                    <option value="3:4" ${settings.aspectRatio === '3:4' ? 'selected' : ''}>3:4 (Портрет)</option>
-                                    <option value="4:3" ${settings.aspectRatio === '4:3' ? 'selected' : ''}>4:3 (Альбом)</option>
-                                    <option value="4:5" ${settings.aspectRatio === '4:5' ? 'selected' : ''}>4:5 (Портрет)</option>
-                                    <option value="5:4" ${settings.aspectRatio === '5:4' ? 'selected' : ''}>5:4 (Альбом)</option>
-                                    <option value="9:16" ${settings.aspectRatio === '9:16' ? 'selected' : ''}>9:16 (Вертикальный)</option>
-                                    <option value="16:9" ${settings.aspectRatio === '16:9' ? 'selected' : ''}>16:9 (Широкий)</option>
-                                    <option value="21:9" ${settings.aspectRatio === '21:9' ? 'selected' : ''}>21:9 (Ультраширокий)</option>
-                                </select>
-                            </div>
-                            <div class="flex-row">
-                                <label for="iig_image_size">Разрешение</label>
-                                <select id="iig_image_size" class="flex1">
-                                    <option value="1K" ${settings.imageSize === '1K' ? 'selected' : ''}>1K (по умолчанию)</option>
-                                    <option value="2K" ${settings.imageSize === '2K' ? 'selected' : ''}>2K</option>
-                                    <option value="4K" ${settings.imageSize === '4K' ? 'selected' : ''}>4K</option>
-                                </select>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="iig-settings-card ${(settings.apiType === 'naistera' && naisteraModelSupportsReferences(settings.naisteraModel)) ? '' : 'iig-hidden'}" id="iig_naistera_refs_section">
-                        <h4>Референсы</h4>
-                        <p class="hint">Отправлять аватарки как референсы для консистентной генерации персонажей.</p>
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_naistera_send_char_avatar" ${settings.naisteraSendCharAvatar ? 'checked' : ''}>
-                            <span>Отправлять аватар {{char}}</span>
-                        </label>
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_naistera_send_user_avatar" ${settings.naisteraSendUserAvatar ? 'checked' : ''}>
-                            <span>Отправлять аватар {{user}}</span>
-                        </label>
-                        <label id="iig_naistera_use_active_persona_avatar_row" class="checkbox_label ${!settings.naisteraSendUserAvatar ? 'iig-hidden' : ''}">
-                            <input type="checkbox" id="iig_naistera_use_active_persona_avatar" ${settings.useActiveUserPersonaAvatar ? 'checked' : ''}>
-                            <span>Брать аватар из активной персоны {{user}}</span>
-                        </label>
-                        <div id="iig_naistera_user_avatar_row" class="flex-row ${!settings.naisteraSendUserAvatar || settings.useActiveUserPersonaAvatar ? 'iig-hidden' : ''}" style="margin-top: 5px;">
-                            <label for="iig_naistera_user_avatar_file">Аватар {{user}}</label>
-                            <select id="iig_naistera_user_avatar_file" class="flex1">
-                                <option value="">-- Не выбран --</option>
-                                ${settings.userAvatarFile ? `<option value="${sanitizeForHtml(settings.userAvatarFile)}" selected>${sanitizeForHtml(settings.userAvatarFile)}</option>` : ''}
-                            </select>
-                            <div id="iig_naistera_refresh_avatars" class="menu_button iig-refresh-btn" title="Обновить список">
-                                <i class="fa-solid fa-sync"></i>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div id="iig_avatar_refs_section" class="iig-settings-card ${settings.apiType !== 'gemini' ? 'hidden' : ''}">
-                        <h4>Референсы</h4>
-                        <p class="hint">Отправлять аватарки как референсы для консистентной генерации персонажей.</p>
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>
-                            <span>Отправлять аватар {{char}}</span>
-                        </label>
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_send_user_avatar" ${settings.sendUserAvatar ? 'checked' : ''}>
-                            <span>Отправлять аватар {{user}}</span>
-                        </label>
-                        <label id="iig_use_active_persona_avatar_row" class="checkbox_label ${!settings.sendUserAvatar ? 'hidden' : ''}">
-                            <input type="checkbox" id="iig_use_active_persona_avatar" ${settings.useActiveUserPersonaAvatar ? 'checked' : ''}>
-                            <span>Брать аватар из активной персоны {{user}}</span>
-                        </label>
-                        <div id="iig_user_avatar_row" class="flex-row ${!settings.sendUserAvatar || settings.useActiveUserPersonaAvatar ? 'hidden' : ''}" style="margin-top: 5px;">
-                            <label for="iig_user_avatar_file">Аватар {{user}}</label>
-                            <select id="iig_user_avatar_file" class="flex1">
-                                <option value="">-- Не выбран --</option>
-                                ${settings.userAvatarFile ? `<option value="${sanitizeForHtml(settings.userAvatarFile)}" selected>${sanitizeForHtml(settings.userAvatarFile)}</option>` : ''}
-                            </select>
-                            <div id="iig_refresh_avatars" class="menu_button iig-refresh-btn" title="Обновить список">
-                                <i class="fa-solid fa-sync"></i>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="iig-settings-card ${((settings.apiType === 'gemini') || (settings.apiType === 'naistera' && naisteraModelSupportsReferences(settings.naisteraModel))) ? '' : 'iig-hidden'}" id="iig_additional_refs_section">
-                        <h4>Дополнительные референсы</h4>
-                        <p class="hint">Референс можно отправлять всегда или по совпадению. Референсу можно указать несколько имён через запятую. </p>
-                        <div id="iig_additional_refs_status" class="hint" style="margin-bottom: 8px;"></div>
-                        <div id="iig_additional_refs_list"></div>
-                        <div class="flex-row" style="margin-top: 8px;">
-                            <div id="iig_additional_refs_add" class="menu_button" style="width: 100%;">
-                                <i class="fa-solid fa-plus" style="margin-right: 6px;"></i>Добавить референс
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="iig-settings-card ${settings.apiType === 'naistera' ? '' : 'iig-hidden'}" id="iig_naistera_video_section">
-                        <h4>Видео</h4>
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="iig_naistera_video_test" ${settings.naisteraVideoTest ? 'checked' : ''}>
-                            <span>Включить генерацию видео</span>
-                        </label>
-                        <div class="iig-video-frequency-row ${settings.naisteraVideoTest ? '' : 'iig-hidden'}" id="iig_naistera_video_frequency_row">
-                            <div class="iig-video-frequency-input">
-                                <span>Каждые</span>
-                                <input
-                                    type="number"
-                                    id="iig_naistera_video_every_n"
-                                    class="text_pole"
-                                    min="1"
-                                    max="999"
-                                    step="1"
-                                    value="${normalizeNaisteraVideoFrequency(settings.naisteraVideoEveryN)}"
-                                >
-                                <span>сообщений.</span>
-                            </div>
-                        </div>
-                    </div>
-
-                    <hr>
-
-                    <div class="iig-settings-card">
-                        <h4>Обработка ошибок</h4>
-                    
-                        <div class="flex-row">
-                            <label for="iig_max_retries">Макс. повторов</label>
-                            <input type="number" id="iig_max_retries" class="text_pole flex1" 
-                                   value="${settings.maxRetries}" min="0" max="5">
-                        </div>
-                        <div class="flex-row">
-                            <label for="iig_retry_delay">Задержка (мс)</label>
-                            <input type="number" id="iig_retry_delay" class="text_pole flex1" 
-                                   value="${settings.retryDelay}" min="500" max="10000" step="500">
-                        </div>
-                    </div>
-
-                    <div class="iig-settings-card">
-                        <h4>Отладка</h4>
-                        <div class="flex-row">
-                            <div id="iig_export_logs" class="menu_button" style="width: 100%;">
-                                <i class="fa-solid fa-download"></i> Экспорт логов
-                            </div>
-                        </div>
-                        <p class="hint">Экспортировать логи расширения для отладки проблем.</p>
-                    </div>
+                    ${buildApiSettingsSectionHtml(settings)}
+                    ${buildStylesSettingsSectionHtml(settings)}
+                    ${buildReferencesSettingsSectionHtml(settings)}
+                    ${buildDebugSettingsSectionHtml(settings)}
                 </div>
             </div>
         </div>
@@ -2911,6 +3274,7 @@ function createSettingsUI() {
     
     // Bind event handlers
     bindSettingsEvents();
+    renderStyleSettings();
 }
 
 /**
@@ -2918,6 +3282,20 @@ function createSettingsUI() {
  */
 function bindSettingsEvents() {
     const settings = getSettings();
+
+    document.querySelectorAll('[data-section-toggle]').forEach((toggle) => {
+        toggle.addEventListener('click', () => {
+            const sectionId = toggle.getAttribute('data-section-toggle');
+            const body = sectionId ? document.getElementById(sectionId) : null;
+            const chevron = toggle.querySelector('.iig-section-chevron');
+            if (!body) {
+                return;
+            }
+
+            body.classList.toggle('iig-hidden');
+            chevron?.classList.toggle('iig-section-chevron-collapsed', body.classList.contains('iig-hidden'));
+        });
+    });
 
     const updateVisibility = () => {
         const apiType = settings.apiType;
@@ -3160,6 +3538,7 @@ function bindSettingsEvents() {
 
     // Naistera refresh user avatars list
     document.getElementById('iig_naistera_refresh_avatars')?.addEventListener('click', async (e) => {
+        e.stopPropagation();
         const btn = e.currentTarget;
         btn.classList.add('loading');
 
@@ -3167,6 +3546,7 @@ function bindSettingsEvents() {
             const avatars = await refreshUserAvatarSelects();
 
             toastr.success(`Найдено аватаров: ${avatars.length}`, 'Генерация картинок');
+            document.getElementById('iig_naistera_user_avatar_dropdown')?.classList.add('open');
         } catch (error) {
             toastr.error('Ошибка загрузки аватаров', 'Генерация картинок');
         } finally {
@@ -3203,6 +3583,7 @@ function bindSettingsEvents() {
 
     // Refresh user avatars list
     document.getElementById('iig_refresh_avatars')?.addEventListener('click', async (e) => {
+        e.stopPropagation();
         const btn = e.currentTarget;
         btn.classList.add('loading');
         
@@ -3210,11 +3591,119 @@ function bindSettingsEvents() {
             const avatars = await refreshUserAvatarSelects();
             
             toastr.success(`Найдено аватаров: ${avatars.length}`, 'Генерация картинок');
+            document.getElementById('iig_user_avatar_dropdown')?.classList.add('open');
         } catch (error) {
             toastr.error('Ошибка загрузки аватаров', 'Генерация картинок');
         } finally {
             btn.classList.remove('loading');
         }
+    });
+
+    for (const { rootId, selectedId, listId } of getUserAvatarDropdownConfigs()) {
+        document.getElementById(selectedId)?.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const dropdown = document.getElementById(rootId);
+            if (!dropdown) {
+                return;
+            }
+
+            const willOpen = !dropdown.classList.contains('open');
+            closeUserAvatarDropdowns();
+            dropdown.classList.toggle('open', willOpen);
+
+            if (willOpen) {
+                const list = document.getElementById(listId);
+                if (list && list.children.length === 0) {
+                    await refreshUserAvatarSelects();
+                }
+            }
+        });
+    }
+
+    document.addEventListener('click', (e) => {
+        const clickedInsideDropdown = getUserAvatarDropdownConfigs().some(({ rootId }) => {
+            const root = document.getElementById(rootId);
+            return root?.contains(e.target);
+        });
+        if (!clickedInsideDropdown) {
+            closeUserAvatarDropdowns();
+        }
+    });
+
+    document.getElementById('iig_style_add')?.addEventListener('click', () => {
+        const input = document.getElementById('iig_new_style_name');
+        const style = createStyle(input?.value || '');
+        if (input) {
+            input.value = '';
+        }
+        saveSettings();
+        renderStyleSettings();
+        iigLog('INFO', `Created style: ${style.name}`);
+    });
+
+    document.getElementById('iig_new_style_name')?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            document.getElementById('iig_style_add')?.click();
+        }
+    });
+
+    document.getElementById('iig_style_presets')?.addEventListener('click', (e) => {
+        const activateButton = e.target instanceof Element ? e.target.closest('[data-style-activate]') : null;
+        if (activateButton) {
+            settings.activeStyleId = activateButton.getAttribute('data-style-activate') || '';
+            saveSettings();
+            renderStyleSettings();
+            return;
+        }
+
+        const removeButton = e.target instanceof Element ? e.target.closest('[data-style-remove]') : null;
+        if (!removeButton) {
+            return;
+        }
+
+        const styleId = removeButton.getAttribute('data-style-remove') || '';
+        removeStyle(styleId);
+        saveSettings();
+        renderStyleSettings();
+    });
+
+    document.getElementById('iig_style_editor')?.addEventListener('input', (e) => {
+        const activeStyle = getActiveStyle(settings);
+        if (!activeStyle) {
+            return;
+        }
+
+        const target = e.target;
+        if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) {
+            return;
+        }
+
+        if (target.id === 'iig_style_name') {
+            updateStyle(activeStyle.id, { name: target.value });
+            saveSettings();
+            const activeButton = document.querySelector(`[data-style-activate="${activeStyle.id}"] span`);
+            if (activeButton) {
+                activeButton.textContent = getActiveStyle(settings)?.name || target.value.trim() || activeStyle.name;
+            }
+            return;
+        }
+        if (target.id === 'iig_style_value') {
+            updateStyle(activeStyle.id, { value: target.value });
+            saveSettings();
+            return;
+        }
+    });
+
+    document.getElementById('iig_style_editor')?.addEventListener('click', (e) => {
+        const disableButton = e.target instanceof Element ? e.target.closest('#iig_style_disable') : null;
+        if (!disableButton) {
+            return;
+        }
+
+        settings.activeStyleId = '';
+        saveSettings();
+        renderStyleSettings();
     });
 
     document.getElementById('iig_additional_refs_add')?.addEventListener('click', () => {
@@ -3224,14 +3713,20 @@ function bindSettingsEvents() {
             return;
         }
 
-        refs.push({ name: '', imagePath: '', matchMode: 'match', enabled: true });
+        refs.push({ name: '', description: '', imagePath: '', matchMode: 'match', enabled: true });
         saveSettings();
         renderAdditionalReferencesList();
     });
 
     document.getElementById('iig_additional_refs_list')?.addEventListener('input', (e) => {
         const target = e.target;
-        if (!(target instanceof HTMLInputElement) || !target.classList.contains('iig-additional-ref-name')) {
+        if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) {
+            return;
+        }
+
+        const isNameField = target.classList.contains('iig-additional-ref-name');
+        const isDescriptionField = target.classList.contains('iig-additional-ref-description');
+        if (!isNameField && !isDescriptionField) {
             return;
         }
 
@@ -3246,7 +3741,12 @@ function bindSettingsEvents() {
             return;
         }
 
-        refs[index].name = target.value;
+        if (isNameField) {
+            refs[index].name = target.value;
+        }
+        if (isDescriptionField) {
+            refs[index].description = target.value;
+        }
         saveSettings();
     });
 
