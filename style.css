@@ -315,6 +315,8 @@
 .iig-debug-actions {
     display: flex;
     justify-content: flex-start;
+    gap: 8px;
+    flex-wrap: wrap;
 }
 
 .iig-button-inline {
@@ -609,6 +611,61 @@
     .iig-avatar-dropdown-selected {
         min-height: 38px;
     }
+}
+
+.iig-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 5000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+}
+
+.iig-modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+}
+
+.iig-modal-card {
+    position: relative;
+    z-index: 1;
+    width: min(520px, 100%);
+    max-width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 14px;
+    border-radius: 10px;
+    background: var(--SmartThemeBlurTintColor);
+    border: 1px solid var(--SmartThemeBorderColor);
+    box-sizing: border-box;
+}
+
+.iig-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.iig-modal-header h4 {
+    margin: 0;
+}
+
+.iig-modal-textarea {
+    width: 100%;
+    min-height: 140px;
+    box-sizing: border-box;
+    resize: vertical;
+}
+
+.iig-modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
 }
 
 /* Loading Placeholder - adaptive to container */

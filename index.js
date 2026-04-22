@@ -53,7 +53,6 @@ const defaultSettings = Object.freeze({
     imageContextCount: 1,
     styles: [],
     activeStyleId: '',
-    styleAsAdditionalReference: false,
     apiType: 'openai', // 'openai' | 'gemini' | 'naistera'
     endpoint: '',
     apiKey: '',
@@ -542,31 +541,11 @@ function buildAdditionalReferencesPromptBlock(matchedRefs = []) {
     return `Additional References:\n${items.map((item) => `- ${item}`).join('\n')}`;
 }
 
-function buildStyleReference(settings = getSettings()) {
-    if (!settings.styleAsAdditionalReference) {
-        return null;
-    }
-
-    const activeStyle = getActiveStyle(settings);
-    const value = String(activeStyle?.value || '').trim();
-    if (!value) {
-        return null;
-    }
-
-    return {
-        name: activeStyle?.name || 'style',
-        description: value,
-    };
-}
-
 function buildFinalGenerationPrompt(prompt, style, matchedAdditionalRefs = [], settings = getSettings()) {
     const effectiveStyle = resolveEffectiveStyle(style, settings);
     let fullPrompt = injectStyleBlock(prompt, effectiveStyle);
 
-    const styleReference = buildStyleReference(settings);
-    const additionalReferencesBlock = buildAdditionalReferencesPromptBlock(
-        styleReference ? [...matchedAdditionalRefs, styleReference] : matchedAdditionalRefs
-    );
+    const additionalReferencesBlock = buildAdditionalReferencesPromptBlock(matchedAdditionalRefs);
     if (additionalReferencesBlock) {
         fullPrompt = `${fullPrompt}\n\n${additionalReferencesBlock}`.trim();
     }
@@ -1008,6 +987,9 @@ function buildReferencesSettingsSectionHtml(settings = getSettings()) {
                     <div id="iig_additional_refs_add" class="menu_button iig-button-inline">
                         <i class="fa-solid fa-plus"></i> Добавить референс
                     </div>
+                    <div id="iig_additional_refs_import" class="menu_button iig-button-inline">
+                        <i class="fa-solid fa-link"></i> Загрузить референс
+                    </div>
                 </div>
                 <div id="iig_additional_refs_status" class="hint" style="margin-bottom: 8px;"></div>
                 <div id="iig_additional_refs_list"></div>
@@ -1040,6 +1022,129 @@ function buildDebugSettingsSectionHtml(settings = getSettings()) {
         </div>
     `;
     return buildSettingsSectionHtml('iig_debug_section', 'Отладка', bodyHtml, false);
+}
+
+function buildReferenceImportModalHtml() {
+    return `
+        <div id="iig_ref_import_modal" class="iig-modal iig-hidden" aria-hidden="true">
+            <div class="iig-modal-backdrop" data-iig-modal-close="true"></div>
+            <div class="iig-modal-card" role="dialog" aria-modal="true" aria-labelledby="iig_ref_import_title">
+                <div class="iig-modal-header">
+                    <h4 id="iig_ref_import_title">Загрузить референс по ссылке</h4>
+                    <div id="iig_ref_import_close" class="menu_button" title="Закрыть">
+                        <i class="fa-solid fa-xmark"></i>
+                    </div>
+                </div>
+                <textarea
+                    id="iig_ref_import_urls"
+                    class="text_pole iig-modal-textarea"
+                    rows="6"
+                    placeholder="Одна ссылка на строку"
+                ></textarea>
+                <div class="iig-modal-actions">
+                    <div id="iig_ref_import_submit" class="menu_button iig-button-inline">
+                        <i class="fa-solid fa-plus"></i> Добавить
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function normalizeReferenceUrlList(rawValue) {
+    return String(rawValue || '')
+        .split(/\r?\n+/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+}
+
+function getReferenceNameFromUrl(url, fallbackIndex = 0) {
+    try {
+        const parsed = new URL(url, window.location.href);
+        const pathname = parsed.pathname || '';
+        const fileName = decodeURIComponent(pathname.split('/').filter(Boolean).pop() || '').trim();
+        if (fileName) {
+            return fileName;
+        }
+    } catch (_error) {
+        // ignore and fallback
+    }
+    return `reference-${fallbackIndex + 1}`;
+}
+
+async function importAdditionalReferencesFromUrls(rawValue) {
+    const settings = getSettings();
+    const refs = ensureAdditionalReferencesArray(settings);
+    const urls = normalizeReferenceUrlList(rawValue);
+    if (urls.length === 0) {
+        throw new Error('Добавьте хотя бы одну ссылку');
+    }
+
+    const availableSlots = MAX_ADDITIONAL_REFERENCES - refs.length;
+    if (availableSlots <= 0) {
+        throw new Error(`Достигнут лимит референсов: ${MAX_ADDITIONAL_REFERENCES}`);
+    }
+
+    const queue = urls.slice(0, availableSlots);
+    const importedNames = [];
+
+    for (let index = 0; index < queue.length; index++) {
+        const url = queue[index];
+        const dataUrl = await imageUrlToDataUrl(url);
+        if (!dataUrl) {
+            throw new Error(`Не удалось загрузить изображение: ${url}`);
+        }
+
+        const name = getReferenceNameFromUrl(url, refs.length + index);
+        const savedPath = await saveImageToFile(dataUrl, {
+            mode: 'additional-reference-import',
+            sourceUrl: url,
+            refIndex: refs.length + index,
+            refName: name,
+        });
+
+        refs.push({
+            name,
+            description: '',
+            imagePath: normalizeStoredImagePath(savedPath),
+            matchMode: 'match',
+            enabled: true,
+        });
+        importedNames.push(name);
+    }
+
+    saveSettings();
+    renderAdditionalReferencesList();
+    return {
+        importedCount: importedNames.length,
+        skippedCount: Math.max(0, urls.length - queue.length),
+    };
+}
+
+function openReferenceImportModal() {
+    const modal = document.getElementById('iig_ref_import_modal');
+    const input = document.getElementById('iig_ref_import_urls');
+    if (!modal || !input) {
+        return;
+    }
+
+    modal.classList.remove('iig-hidden');
+    modal.setAttribute('aria-hidden', 'false');
+    setTimeout(() => input.focus(), 0);
+}
+
+function closeReferenceImportModal() {
+    const modal = document.getElementById('iig_ref_import_modal');
+    const input = document.getElementById('iig_ref_import_urls');
+    if (!modal) {
+        return;
+    }
+
+    modal.classList.add('iig-hidden');
+    modal.setAttribute('aria-hidden', 'true');
+    if (input) {
+        input.value = '';
+    }
 }
 
 async function readFileAsDataUrl(file) {
@@ -3268,6 +3373,7 @@ function createSettingsUI() {
                 </div>
             </div>
         </div>
+        ${buildReferenceImportModalHtml()}
     `;
     
     container.insertAdjacentHTML('beforeend', html);
@@ -3716,6 +3822,51 @@ function bindSettingsEvents() {
         refs.push({ name: '', description: '', imagePath: '', matchMode: 'match', enabled: true });
         saveSettings();
         renderAdditionalReferencesList();
+    });
+
+    document.getElementById('iig_additional_refs_import')?.addEventListener('click', () => {
+        openReferenceImportModal();
+    });
+
+    document.getElementById('iig_ref_import_close')?.addEventListener('click', () => {
+        closeReferenceImportModal();
+    });
+
+    document.querySelector('#iig_ref_import_modal [data-iig-modal-close="true"]')?.addEventListener('click', () => {
+        closeReferenceImportModal();
+    });
+
+    document.getElementById('iig_ref_import_submit')?.addEventListener('click', async () => {
+        const button = document.getElementById('iig_ref_import_submit');
+        const input = document.getElementById('iig_ref_import_urls');
+        if (!(button instanceof HTMLDivElement) || !(input instanceof HTMLTextAreaElement)) {
+            return;
+        }
+
+        button.classList.add('loading');
+        try {
+            const result = await importAdditionalReferencesFromUrls(input.value);
+            closeReferenceImportModal();
+            toastr.success(
+                `Загружено: ${result.importedCount}${result.skippedCount > 0 ? `, пропущено: ${result.skippedCount}` : ''}`,
+                'Генерация картинок'
+            );
+        } catch (error) {
+            toastr.error(`Ошибка импорта: ${error.message || error}`, 'Генерация картинок');
+        } finally {
+            button.classList.remove('loading');
+        }
+    });
+
+    document.getElementById('iig_ref_import_urls')?.addEventListener('keydown', async (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            e.preventDefault();
+            document.getElementById('iig_ref_import_submit')?.click();
+        }
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            closeReferenceImportModal();
+        }
     });
 
     document.getElementById('iig_additional_refs_list')?.addEventListener('input', (e) => {
