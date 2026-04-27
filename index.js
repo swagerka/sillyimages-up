@@ -53,7 +53,7 @@ const defaultSettings = Object.freeze({
     imageContextCount: 1,
     styles: [],
     activeStyleId: '',
-    apiType: 'openai', // 'openai' | 'gemini' | 'naistera'
+    apiType: 'openai', // 'openai' | 'gemini' | 'naistera' | 'comfyui'
     endpoint: '',
     apiKey: '',
     model: '',
@@ -76,6 +76,11 @@ const defaultSettings = Object.freeze({
     naisteraVideoTest: false,
     naisteraVideoEveryN: 1,
     additionalReferences: [],
+    // ComfyUI specific
+    comfyUiUrl: 'http://127.0.0.1:8188',
+    comfyWorkflowJson: '',
+    comfyPromptNodeId: '185',
+    comfyReferenceImageNodeId: '15',
 });
 
 const MAX_CONTEXT_IMAGES = 3;
@@ -139,6 +144,7 @@ function isGeminiModel(modelId) {
 const NAISTERA_MODELS = Object.freeze(['grok', 'grok-pro', 'nano banana 2', 'novelai']);
 const DEFAULT_ENDPOINTS = Object.freeze({
     naistera: 'https://naistera.org',
+    comfyui: 'http://127.0.0.1:8188',
 });
 const ENDPOINT_PLACEHOLDERS = Object.freeze({
     openai: 'https://api.openai.com',
@@ -777,17 +783,40 @@ function buildApiSettingsSectionHtml(settings = getSettings()) {
                     <option value="openai" ${settings.apiType === 'openai' ? 'selected' : ''}>OpenAI-совместимый (/v1/images/generations)</option>
                     <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini-совместимый (nano-banana)</option>
                     <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>Naistera (naistera.org)</option>
+                    <option value="comfyui" ${settings.apiType === 'comfyui' ? 'selected' : ''}>ComfyUI (workflow API)</option>
                 </select>
                 <div></div>
             </div>
 
-            <div class="flex-row">
+            <div class="flex-row" id="iig_endpoint_row">
                 <label for="iig_endpoint">URL эндпоинта</label>
                 <input type="text" id="iig_endpoint" class="text_pole flex1" value="${settings.endpoint}" placeholder="https://api.example.com">
                 <div></div>
             </div>
+            <div class="${settings.apiType === 'comfyui' ? '' : 'iig-hidden'}" id="iig_comfyui_settings">
+                <div class="flex-row">
+                    <label for="iig_comfyui_url">URL ComfyUI</label>
+                    <input type="text" id="iig_comfyui_url" class="text_pole flex1" value="${sanitizeForHtml(settings.comfyUiUrl || 'http://127.0.0.1:8188')}" placeholder="http://127.0.0.1:8188">
+                    <div></div>
+                </div>
+                <div class="flex-row">
+                    <label for="iig_comfyui_prompt_node_id">Prompt node ID</label>
+                    <input type="text" id="iig_comfyui_prompt_node_id" class="text_pole flex1" value="${sanitizeForHtml(settings.comfyPromptNodeId || '185')}" placeholder="185">
+                    <div></div>
+                </div>
+                <div class="flex-row">
+                    <label for="iig_comfyui_reference_node_id">Reference image node ID</label>
+                    <input type="text" id="iig_comfyui_reference_node_id" class="text_pole flex1" value="${sanitizeForHtml(settings.comfyReferenceImageNodeId || '15')}" placeholder="15">
+                    <div></div>
+                </div>
+                <div class="flex-row">
+                    <label for="iig_comfyui_workflow_json">Workflow JSON</label>
+                    <textarea id="iig_comfyui_workflow_json" class="text_pole flex1 iig-settings-textarea" rows="8" placeholder="Вставь сюда JSON workflow из ComfyUI">${sanitizeForHtml(settings.comfyWorkflowJson || '')}</textarea>
+                    <div></div>
+                </div>
+            </div>
 
-            <div class="flex-row">
+            <div class="flex-row" id="iig_api_key_row">
                 <label for="iig_api_key">API ключ</label>
                 <input type="password" id="iig_api_key" class="text_pole flex1" value="${settings.apiKey}">
                 <div id="iig_key_toggle" class="menu_button iig-key-toggle" title="Показать/Скрыть">
@@ -3420,11 +3449,14 @@ function bindSettingsEvents() {
         const isNaistera = apiType === 'naistera';
         const isGemini = apiType === 'gemini';
         const isOpenAI = apiType === 'openai';
+        const isComfyUI = apiType === 'comfyui';
         const base64RefsSupported = isOpenAI || isGemini;
         const naisteraRefsSupported = isNaistera && naisteraModelSupportsReferences(settings.naisteraModel);
 
         // Model is used for OpenAI and Gemini; Naistera does not need a model.
-        document.getElementById('iig_model_row')?.classList.toggle('iig-hidden', isNaistera);
+        document.getElementById('iig_model_row')?.classList.toggle('iig-hidden', isNaistera || isComfyUI);
+        document.getElementById('iig_endpoint_row')?.classList.toggle('iig-hidden', isComfyUI);
+        document.getElementById('iig_api_key_row')?.classList.toggle('iig-hidden', isComfyUI);
         document.getElementById('iig_image_context_section')?.classList.toggle('iig-hidden', !(base64RefsSupported || naisteraRefsSupported));
         document.getElementById('iig_image_context_count_row')?.classList.toggle('iig-hidden', !((base64RefsSupported || naisteraRefsSupported) && settings.imageContextEnabled));
         document.getElementById('iig_additional_refs_section')?.classList.toggle('iig-hidden', !(base64RefsSupported || naisteraRefsSupported));
@@ -3432,6 +3464,7 @@ function bindSettingsEvents() {
         // OpenAI-only params
         document.getElementById('iig_size_row')?.classList.toggle('iig-hidden', !isOpenAI);
         document.getElementById('iig_quality_row')?.classList.toggle('iig-hidden', !isOpenAI);
+        document.getElementById('iig_comfyui_settings')?.classList.toggle('iig-hidden', !isComfyUI);
 
         // Naistera-only params
         document.getElementById('iig_naistera_model_row')?.classList.toggle('iig-hidden', !isNaistera);
