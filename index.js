@@ -920,8 +920,8 @@ function buildReferencesSettingsSectionHtml(settings = getSettings()) {
 
     const bodyHtml = `
         <div class="iig-settings-card">
-            <div id="iig_avatar_refs_section" class="iig-settings-card-nested ${settings.apiType !== 'gemini' ? 'hidden' : ''}">
-                <h4>Gemini / nano-banana</h4>
+            <div id="iig_avatar_refs_section" class="iig-settings-card-nested ${!(settings.apiType === 'openai' || settings.apiType === 'gemini') ? 'hidden' : ''}">
+                <h4>OpenAI-compatible / Gemini</h4>
                 <label class="checkbox_label">
                     <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>
                     <span>Отправлять аватар {{char}}</span>
@@ -966,7 +966,7 @@ function buildReferencesSettingsSectionHtml(settings = getSettings()) {
                 </div>
             </div>
 
-            <div class="iig-settings-card-nested ${((settings.apiType === 'gemini') || (settings.apiType === 'naistera' && naisteraModelSupportsReferences(settings.naisteraModel))) ? '' : 'iig-hidden'}" id="iig_image_context_section">
+            <div class="iig-settings-card-nested ${((settings.apiType === 'openai') || (settings.apiType === 'gemini') || (settings.apiType === 'naistera' && naisteraModelSupportsReferences(settings.naisteraModel))) ? '' : 'iig-hidden'}" id="iig_image_context_section">
                 <h4>Контекст картинок</h4>
                 <label class="checkbox_label">
                     <input type="checkbox" id="iig_image_context_enabled" ${settings.imageContextEnabled ? 'checked' : ''}>
@@ -981,7 +981,7 @@ function buildReferencesSettingsSectionHtml(settings = getSettings()) {
                 </div>
             </div>
 
-            <div class="iig-settings-card-nested ${((settings.apiType === 'gemini') || (settings.apiType === 'naistera' && naisteraModelSupportsReferences(settings.naisteraModel))) ? '' : 'iig-hidden'}" id="iig_additional_refs_section">
+            <div class="iig-settings-card-nested ${((settings.apiType === 'openai') || (settings.apiType === 'gemini') || (settings.apiType === 'naistera' && naisteraModelSupportsReferences(settings.naisteraModel))) ? '' : 'iig-hidden'}" id="iig_additional_refs_section">
                 <h4>Дополнительные референсы</h4>
                 <div class="iig-additional-ref-actions">
                     <div id="iig_additional_refs_add" class="menu_button iig-button-inline">
@@ -1835,7 +1835,12 @@ async function generateImageOpenAI(prompt, style, referenceImages = [], options 
     const settings = getSettings();
     const url = `${settings.endpoint.replace(/\/$/, '')}/v1/images/generations`;
     
-    const fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings);
+    let fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings);
+
+    if (referenceImages.length > 0) {
+        const refInstruction = `[CRITICAL: The reference image(s) show the EXACT appearance of the character(s). You MUST precisely copy their: face structure, eye color, hair color and style, skin tone, body type, clothing, and all distinctive features. Do not deviate from the reference appearances.]`;
+        fullPrompt = `${refInstruction}\n\n${fullPrompt}`;
+    }
     
     // Map aspect ratio to size if provided in tag
     let size = settings.size;
@@ -1854,9 +1859,15 @@ async function generateImageOpenAI(prompt, style, referenceImages = [], options 
         response_format: 'b64_json'
     };
     
-    // Add reference image if supported (for models like GPT-Image-1, FLUX)
+    // Add reference images if supported by the OpenAI-compatible provider
     if (referenceImages.length > 0) {
-        body.image = `data:image/png;base64,${referenceImages[0]}`;
+        const openAIReferenceImages = referenceImages
+            .slice(0, MAX_GENERATION_REFERENCE_IMAGES)
+            .map((imgB64) => `data:image/png;base64,${imgB64}`);
+
+        body.image = openAIReferenceImages.length === 1
+            ? openAIReferenceImages[0]
+            : openAIReferenceImages;
     }
     
     const response = await fetch(url, {
@@ -2363,14 +2374,15 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
     const maxRetries = settings.maxRetries;
     const baseDelay = settings.retryDelay;
     const normalizedNaisteraModel = normalizeNaisteraModel(options.model || settings.naisteraModel);
+    const base64RefsSupported = settings.apiType === 'openai' || settings.apiType === 'gemini';
     const naisteraRefsSupported = naisteraModelSupportsReferences(normalizedNaisteraModel);
     
     // Collect reference images (provider-specific)
     const referenceImages = [];
     const referenceDataUrls = [];
 
-    // Gemini/nano-banana references: base64 only
-    if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
+    // OpenAI-compatible and Gemini references: base64 only
+    if (base64RefsSupported) {
         if (settings.sendCharAvatar) {
             const charAvatar = await getCharacterAvatarBase64();
             if (charAvatar) referenceImages.push(charAvatar);
@@ -2411,7 +2423,7 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
             continue;
         }
 
-        if ((settings.apiType === 'gemini' || isGeminiModel(settings.model)) && referenceImages.length < MAX_GENERATION_REFERENCE_IMAGES) {
+        if (base64RefsSupported && referenceImages.length < MAX_GENERATION_REFERENCE_IMAGES) {
             const b64 = await imageUrlToBase64(imagePath);
             if (b64) {
                 referenceImages.push(b64);
@@ -2428,7 +2440,7 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
 
     if (settings.imageContextEnabled) {
         const contextCount = normalizeImageContextCount(settings.imageContextCount);
-        if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
+        if (base64RefsSupported) {
             const contextRefs = await collectPreviousContextReferences(
                 options.messageId,
                 'base64',
@@ -2473,7 +2485,7 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
                     videoTestMode: enableVideoTest,
                     videoEveryN: settings.naisteraVideoEveryN,
                 });
-            } else if (settings.apiType === 'gemini' || isGeminiModel(settings.model)) {
+            } else if (settings.apiType === 'gemini') {
                 generated = await generateImageGemini(prompt, style, referenceImages, {
                     ...options,
                     matchedAdditionalRefs,
@@ -3408,13 +3420,14 @@ function bindSettingsEvents() {
         const isNaistera = apiType === 'naistera';
         const isGemini = apiType === 'gemini';
         const isOpenAI = apiType === 'openai';
+        const base64RefsSupported = isOpenAI || isGemini;
         const naisteraRefsSupported = isNaistera && naisteraModelSupportsReferences(settings.naisteraModel);
 
         // Model is used for OpenAI and Gemini; Naistera does not need a model.
         document.getElementById('iig_model_row')?.classList.toggle('iig-hidden', isNaistera);
-        document.getElementById('iig_image_context_section')?.classList.toggle('iig-hidden', !(isGemini || naisteraRefsSupported));
-        document.getElementById('iig_image_context_count_row')?.classList.toggle('iig-hidden', !((isGemini || naisteraRefsSupported) && settings.imageContextEnabled));
-        document.getElementById('iig_additional_refs_section')?.classList.toggle('iig-hidden', !(isGemini || naisteraRefsSupported));
+        document.getElementById('iig_image_context_section')?.classList.toggle('iig-hidden', !(base64RefsSupported || naisteraRefsSupported));
+        document.getElementById('iig_image_context_count_row')?.classList.toggle('iig-hidden', !((base64RefsSupported || naisteraRefsSupported) && settings.imageContextEnabled));
+        document.getElementById('iig_additional_refs_section')?.classList.toggle('iig-hidden', !(base64RefsSupported || naisteraRefsSupported));
 
         // OpenAI-only params
         document.getElementById('iig_size_row')?.classList.toggle('iig-hidden', !isOpenAI);
@@ -3439,19 +3452,21 @@ function bindSettingsEvents() {
             endpointInput.placeholder = getEndpointPlaceholder(apiType);
         }
 
-        // Avatar section is only for Gemini/nano-banana
+        // Generation parameters section is only for Gemini/nano-banana
         const avatarSection = document.getElementById('iig_avatar_section');
         if (avatarSection) {
             avatarSection.classList.toggle('hidden', !isGemini);
         }
+
+        // Avatar references are available for OpenAI-compatible and Gemini
         const avatarRefsSection = document.getElementById('iig_avatar_refs_section');
         if (avatarRefsSection) {
-            avatarRefsSection.classList.toggle('hidden', !isGemini);
+            avatarRefsSection.classList.toggle('hidden', !base64RefsSupported);
         }
-        document.getElementById('iig_use_active_persona_avatar_row')?.classList.toggle('hidden', !(isGemini && settings.sendUserAvatar));
+        document.getElementById('iig_use_active_persona_avatar_row')?.classList.toggle('hidden', !(base64RefsSupported && settings.sendUserAvatar));
         document.getElementById('iig_user_avatar_row')?.classList.toggle(
             'hidden',
-            !(isGemini && settings.sendUserAvatar && !settings.useActiveUserPersonaAvatar)
+            !(base64RefsSupported && settings.sendUserAvatar && !settings.useActiveUserPersonaAvatar)
         );
     };
     
@@ -3528,13 +3543,7 @@ function bindSettingsEvents() {
     document.getElementById('iig_model')?.addEventListener('change', (e) => {
         settings.model = e.target.value;
         saveSettings();
-        
-        // Auto-switch API type based on model
-        if (isGeminiModel(e.target.value)) {
-            document.getElementById('iig_api_type').value = 'gemini';
-            settings.apiType = 'gemini';
-            updateVisibility();
-        }
+        updateVisibility();
     });
     
     // Refresh models
