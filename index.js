@@ -2505,8 +2505,13 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
         try {
             onStatusUpdate?.(`Генерация${attempt > 0 ? ` (повтор ${attempt}/${maxRetries})` : ''}...`);
             let generated;
-            // Choose API based on type or model
-            if (settings.apiType === 'naistera') {
+            // Choose API based on type
+            if (settings.apiType === 'comfyui') {
+                generated = await generateImageComfyUI(prompt, style, {
+                    ...options,
+                    matchedAdditionalRefs,
+                });
+            } else if (settings.apiType === 'naistera') {
                 generated = await generateImageNaistera(prompt, style, {
                     ...options,
                     referenceImages: referenceDataUrls,
